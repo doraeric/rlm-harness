@@ -92,7 +92,7 @@ class _StubClaudeAgentLM:
 
 
 def _stub_claude_agent_lm(monkeypatch):
-    import rlm_harness.claude_agent_lm as cal
+    import rlm_harness.community.claude_agent_lm as cal
 
     _StubClaudeAgentLM.calls = []
     monkeypatch.setattr(cal, "ClaudeAgentLM", _StubClaudeAgentLM)
@@ -183,6 +183,33 @@ def test_configure_warns_when_a_timeout_cannot_reach_an_auto_routed_role(monkeyp
     assert "timeout_s" in msg          # names the seam that DOES let you choose the number
 
 
+def test_the_timeout_warning_names_each_routed_role_and_no_default(monkeypatch, caplog):
+    """The deadline belongs to the adapter, so the warning names the class per role and quotes no
+    number that would be wrong for another route."""
+    monkeypatch.setattr(rt, "_try_instrument", lambda: None)
+    _stub_claude_agent_lm(monkeypatch)
+    with caplog.at_level("WARNING", logger="rlm_harness.runtime"):
+        rt.configure(
+            RLMConfig(main_model="claude-agent-sdk/sonnet", sub_model="claude-agent-sdk/haiku",
+                      observe=False, request_timeout_s=45.0)
+        )
+    msg = "\n".join(r.getMessage() for r in caplog.records if "request_timeout_s" in r.getMessage())
+    assert "main_lm to ClaudeAgentLM, sub_lm to ClaudeAgentLM" in msg
+    assert "600" not in msg
+
+
+def test_per_role_kwargs_on_an_auto_routed_role_warn_naming_its_class(monkeypatch, caplog):
+    """configure() did not build that LM, so the kwargs reach nothing; saying nothing would leave a
+    consumer believing its sampling settings applied."""
+    monkeypatch.setattr(rt, "_try_instrument", lambda: None)
+    _stub_claude_agent_lm(monkeypatch)
+    with caplog.at_level("WARNING", logger="rlm_harness.runtime"):
+        rt.configure(RLMConfig(main_model="claude-agent-sdk/sonnet", sub_model="x", observe=False,
+                               main_lm_kwargs={"temperature": 0.1}))
+    msg = "\n".join(r.getMessage() for r in caplog.records if "main_lm_kwargs" in r.getMessage())
+    assert "auto-routed to ClaudeAgentLM" in msg and "temperature" in msg
+
+
 def test_no_warning_when_no_role_was_auto_routed(monkeypatch, caplog):
     """A plain litellm setup consumes the knob fully: warning there would be noise, and noise
     is how a real warning gets ignored."""
@@ -211,8 +238,12 @@ def test_no_warning_for_an_explicitly_injected_lm(monkeypatch, caplog):
 def test_configure_bare_subscription_prefix_raises_value_error_not_system_exit(monkeypatch):
     monkeypatch.setattr(rt, "_try_instrument", lambda: None)
     _stub_claude_agent_lm(monkeypatch)
-    with pytest.raises(ValueError, match=r"expected claude-agent-sdk/<id>"):
+    with pytest.raises(ValueError) as exc:
         rt.configure(RLMConfig(main_model="claude-agent-sdk/", sub_model="x", observe=False))
+    assert str(exc.value) == (
+        "'claude-agent-sdk/' names no model: expected claude-agent-sdk/<id>, "
+        "e.g. claude-agent-sdk/claude-sonnet-5."
+    )
 
 
 def test_configure_plain_model_never_routes(monkeypatch):
@@ -232,7 +263,7 @@ def test_configure_stale_anthropic_api_key_raises_runtime_error_uncollided(monke
     # configure()'s own unrelated ownership-error swallow: the LM-construction step (where this
     # RuntimeError originates) runs entirely BEFORE the try/except that wraps dspy.configure(...),
     # so it cannot reach that handler regardless of message content.
-    import rlm_harness.claude_agent_lm as cal
+    import rlm_harness.community.claude_agent_lm as cal
 
     monkeypatch.setattr(rt, "_try_instrument", lambda: None)
     monkeypatch.setattr(cal, "_require_claude_agent_sdk", lambda: None)  # bypass the SDK-install check

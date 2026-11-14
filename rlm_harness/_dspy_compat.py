@@ -38,6 +38,8 @@ import contextlib
 import copy
 import dataclasses
 import inspect
+import json
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
 
@@ -200,6 +202,63 @@ def rlm_budget_kwargs(
                 resolved[name] = values[canonical]
                 break
     return resolved
+
+
+def rlm_budget_values(rlm: Any) -> dict[str, int]:
+    """The three caps a built ``dspy.RLM`` will enforce, under the kit's names.
+
+    Read back from the program rather than from ``RLMConfig``, because ``_build_rlm``'s ``except
+    TypeError`` fallback can drop all three to dspy's defaults, and a trace recording the configured
+    numbers would then describe a prompt (``iteration: "3/20"``) the model never saw. dspy stores each
+    cap under its constructor spelling, so the same alias table resolves it. A cap the installed dspy
+    does not expose is absent, never guessed.
+    """
+    out: dict[str, int] = {}
+    for canonical, candidates in _BUDGET_ALIASES:
+        for name in candidates:
+            value = getattr(rlm, name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                out[canonical] = value
+                break
+    return out
+
+
+#: Where a ``dspy.RLM`` keeps its two predictors, by the role the trace records them under.
+#: Newest spelling first, the same shape as ``_BUDGET_ALIASES``: the next rename is one entry here.
+_PREDICTOR_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("action", ("generate_action",)),
+    ("extract", ("extract",)),
+)
+
+
+def rlm_predictor_roles(rlm: Any) -> dict[str, Any]:
+    """``{"action": predictor, "extract": predictor}`` for a built ``dspy.RLM``.
+
+    The trace records each call under its role because the attribute names belong to dspy. A role the
+    installed dspy does not expose is absent and its calls are not captured, which thins the trace
+    without misattributing anything.
+    """
+    out: dict[str, Any] = {}
+    for role, candidates in _PREDICTOR_ROLES:
+        for name in candidates:
+            predictor = getattr(rlm, name, None)
+            if predictor is not None and hasattr(predictor, "signature"):
+                out[role] = predictor
+                break
+    return out
+
+
+def rlm_user_tools(rlm: Any) -> dict[str, Any]:
+    """The caller's tools as dspy will document them to the model: ``{name: dspy.Tool}``.
+
+    ``RLM.tools`` is dspy's public property for this set, which excludes ``llm_query`` and
+    ``llm_query_batched``. ``{}`` when the installed dspy has no such property.
+    """
+    try:
+        tools = rlm.tools
+    except Exception:
+        return {}
+    return dict(tools) if isinstance(tools, Mapping) else {}
 
 
 #: Names dspy owns inside the sandbox. The hardcoded floor for
@@ -713,20 +772,21 @@ def applied_lm_budget(lm: Any) -> dict[str, Any] | None:
 
     **"Carries", not "applied", and the difference is not pedantry.** Reading ``lm.kwargs`` is
     right because dspy's own truncation check reads the same dict -- which is to say this rests on
-    the assumption that an LM's kwargs ARE what it applied. That assumption has one shipped
-    counterexample: ``claude_agent_lm.ClaudeAgentLM`` tolerates and IGNORES a ``max_tokens=``
-    (the Claude Agent SDK exposes no sampling controls), so a cap passed there is reported here and
-    ``completion_tokens`` can exceed it. This function cannot detect that -- an LM exposes no
-    attestation of what it honoured -- so the honest contract is the one stated: this is what the
+    the assumption that an LM's kwargs ARE what it applied. That assumption has two shipped
+    counterexamples: ``community.claude_agent_lm.ClaudeAgentLM`` and
+    ``community.antigravity_lm.AntigravityLM`` both tolerate and IGNORE a ``max_tokens=``
+    (neither the Claude Agent SDK nor the ``agy`` CLI exposes an output cap), so a cap passed to
+    either is reported here and ``completion_tokens`` can exceed it. This function cannot detect
+    that -- an LM exposes no attestation of what it honoured -- so the honest contract is the one stated: this is what the
     LM carries, and it equals what was applied for every LM that honours its own kwargs. A READER
     of the finished trace is better placed, with one attribution trap: ``completion_tokens`` above
     the largest of the per-role token caps falsifies the equality (it can never confirm it), but
     above ONE role's cap it proves nothing: ``budgets`` records no model name and ``usage`` is
     keyed by model, so the trace alone maps no usage entry to a role -- differing model strings do
-    not rescue that, they only make it less obvious. This particular LM
-    needs no attribution at all: it is recognisable by the ``SUBSCRIPTION_PREFIX`` on its model
-    key. See that class's docstring, which names itself as
-    the exception at the point a caller would pass the kwarg.
+    not rescue that, they only make it less obvious. These two LMs
+    need no attribution at all: each is recognisable by its route's prefix on its model key
+    (``"claude-agent-sdk/"``, ``"agy/"``; see ``community.ROUTES``). See each class's docstring,
+    which names itself as the exception at the point a caller would pass the kwarg.
 
     **Both key names, and the found one is reported.** dspy rewrites ``max_tokens`` to
     ``max_completion_tokens`` in ``LM._get_initial_kwargs`` for OpenAI reasoning models, so
@@ -820,6 +880,115 @@ def applied_thinking_budget(lm: Any) -> dict[str, Any] | None:
                 if found is not None:
                     return {"value": found, "key": f"{prefix}{outer}.{inner}"}
     return None
+
+
+#: The ``lm.kwargs`` keys :func:`lm_settings` records, at the top level and inside ``extra_body``. An
+#: allowlist and never a denylist, because ``lm.kwargs`` carries ``api_key`` for every LM the kit builds
+#: and a passthrough dict can hold headers, a base URL or a token under any name. A key outside the
+#: list is still sent to the provider; the trace names it in ``unrecorded_keys`` without its value.
+_LM_SETTING_KEYS = frozenset({
+    "temperature", "top_p", "top_k", "min_p", "n", "seed", "stop",
+    "max_tokens", "max_completion_tokens",
+    "presence_penalty", "frequency_penalty", "repetition_penalty",
+    "logprobs", "top_logprobs", "rollout_id", "verbosity", "max_output_tokens",
+    "reasoning_effort", "reasoning", "thinking",
+    *_THINKING_BUDGET_KEYS,
+})
+#: Read inside ``extra_body`` only: server-side knobs vLLM and similar servers take there.
+_LM_EXTRA_BODY_KEYS = _LM_SETTING_KEYS | {"chat_template_kwargs", "enable_thinking",
+                                          "include_reasoning"}
+#: The allowlist applies at every depth. An allowlisted key whose value is a mapping keeps only these
+#: inner keys, and anything else inside it is named in ``unrecorded_keys``, because an allowlisted
+#: name says nothing about what a caller nested under it.
+_LM_NESTED_KEYS: dict[str, frozenset[str]] = {
+    "thinking": frozenset({"type", "budget_tokens"}),
+    "reasoning": frozenset({"effort", "max_tokens", "summary", "enabled", "exclude"}),
+    "chat_template_kwargs": frozenset({"enable_thinking", "thinking", "reasoning_effort",
+                                       *_THINKING_BUDGET_KEYS}),
+}
+
+
+def _setting_value(path: str, key: str, value: Any, unrecorded: list[str]) -> Any:
+    """``value`` with the nested allowlist applied, or ``_DROP`` when nothing of it may be kept."""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(v, (str, int, float, bool)) for v in value):
+            return list(value)
+        unrecorded.append(path)
+        return _DROP
+    if isinstance(value, dict):
+        allowed = _LM_NESTED_KEYS.get(key, frozenset())
+        kept = {}
+        for inner, inner_value in value.items():
+            inner_path = f"{path}.{inner}"
+            if inner_value is None:
+                continue
+            if inner not in allowed:
+                unrecorded.append(inner_path)
+                continue
+            got = _setting_value(inner_path, str(inner), inner_value, unrecorded)
+            if got is not _DROP:
+                kept[inner] = got
+        return kept if kept else _DROP
+    unrecorded.append(path)
+    return _DROP
+
+
+_DROP = object()
+
+
+def lm_settings(lm: Any) -> dict[str, Any] | None:
+    """``{"model", "kwargs", "unrecorded_keys"}``: the model and sampling settings ``lm`` carries.
+
+    Recorded as ``rlm_setup.lm``, so a corpus sampled from one teacher at several temperatures or
+    budgets says which setting produced each trace. Read from the LM rather than ``RLMConfig`` for the
+    reason :func:`applied_lm_budget` gives, with the same caveat: an LM that ignores a kwarg
+    still reports it, as ``ClaudeAgentLM`` and ``AntigravityLM`` both do (neither the Claude Agent
+    SDK nor the ``agy`` CLI exposes sampling controls).
+
+    ``kwargs`` holds only :data:`_LM_SETTING_KEYS` (and :data:`_LM_EXTRA_BODY_KEYS` under
+    ``extra_body``) whose value is not ``None``, and the allowlist applies at every depth: inside an
+    allowlisted mapping only :data:`_LM_NESTED_KEYS` survive, and a list survives only when every
+    item is a scalar. ``unrecorded_keys`` names every other key that was set, as ``"api_key"``,
+    ``"extra_body.foo"`` or ``"thinking.foo"``, so a reader can tell "not recorded" from "not set".
+    The ``model`` string is recorded as given, as ``sub_call.model`` already is. ``None`` when
+    ``lm`` is ``None``.
+    """
+    if lm is None:
+        return None
+    raw = getattr(lm, "kwargs", None)
+    raw = raw if isinstance(raw, dict) else {}
+    kept: dict[str, Any] = {}
+    unrecorded: list[str] = []
+    for key, value in raw.items():
+        if value is None:
+            continue
+        if key == "extra_body" and isinstance(value, dict):
+            body = {}
+            for inner, inner_value in value.items():
+                if inner_value is None:
+                    continue
+                if inner in _LM_EXTRA_BODY_KEYS:
+                    got = _setting_value(f"extra_body.{inner}", inner, inner_value, unrecorded)
+                    if got is not _DROP:
+                        body[inner] = got
+                else:
+                    unrecorded.append(f"extra_body.{inner}")
+            if body:
+                kept["extra_body"] = body
+        elif key in _LM_SETTING_KEYS:
+            got = _setting_value(key, key, value, unrecorded)
+            if got is not _DROP:
+                kept[key] = got
+        else:
+            unrecorded.append(key)
+    model = getattr(lm, "model", None)
+    return {
+        "model": None if model is None else str(model),
+        "kwargs": json.loads(json.dumps(kept, ensure_ascii=False, default=str)),
+        "unrecorded_keys": sorted(unrecorded),
+    }
 
 
 def lm_cache_is_live(lm: Any) -> bool:

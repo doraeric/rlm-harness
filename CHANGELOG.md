@@ -4,6 +4,57 @@ All notable changes to `rlm-harness`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/). Versions track
 `rlm_harness/__init__.__version__` and `pyproject.toml` (kept in sync).
 
+## [Unreleased]
+
+### Added
+
+- **`rlm_harness/community/`**, one place for models that run on a vendor's consumer sign-in through the vendor's own tool, and the document to read before using any of them. `community/README.md` opens with what the kit does not promise: that a route keeps working, that it is affiliated with any vendor, or that it reads anyone's terms for you. Its table gives each route the vendor's own words, a link and the date they were read. `ROUTES` is the prefix table `configure()` routes `main_model` / `sub_model` by, so a new route is one entry there and needs no change to `runtime.py`. A route whose vendor has not explicitly allowed this use logs one warning per process the first time it is built. `ClaudeAgentLM` is the only route today, and Anthropic allows it in writing, so no existing run logs anything new.
+
+### Changed
+
+- **`ClaudeAgentLM` lives in `rlm_harness/community/claude_agent_lm.py`.** `rlm_harness.ClaudeAgentLM`, `rlm_harness.SUBSCRIPTION_PREFIX` and `rlm_harness.community.ClaudeAgentLM` all work. `rlm_harness.claude_agent_lm` is an alias of the moved module, so imports, attribute access and `monkeypatch` through it reach the real one; it stays until the next major release and warns nothing. The module's logger is now `rlm_harness.community.claude_agent_lm`, so a logging filter on the old name needs the new one. `configure()` now imports an adapter module only when a model string names its prefix; it used to import `claude_agent_lm` on every call.
+- The warning `configure()` logs when `request_timeout_s` cannot reach an auto-routed role names the class each role was routed to, and no longer quotes a default deadline.
+- **Community routes added after `ClaudeAgentLM` are outside the SemVer promise** (`docs/CONVENTIONS.md`): they are exported from `rlm_harness.community` only and can be withdrawn in a minor release if a vendor objects.
+
+### Fixed
+
+- **`main_lm_kwargs` / `sub_lm_kwargs` on an auto-routed role now log a warning.** `configure()` does not build that LM, so the kwargs reached nothing, and the warning meant to say so fired only for an LM passed in by hand. It now also fires for a routed role and names the class it went to.
+- The error `RLMConfig` raises for a refused `main_lm_kwargs` / `sub_lm_kwargs` key no longer says nothing records the override. The trace names such a key in `rlm_setup.lm.unrecorded_keys`; what it never records is the value, and the message now says that.
+
+## [1.26.0] - 2026-11-06
+
+**`export_counterfactual_extracts` builds extract-fallback training samples from runs that ended by SUBMIT.** dspy sends its `extract` request only when a trajectory runs out of iterations, so real extract calls are rare in a corpus and mostly come from runs that failed. A run that submitted holds everything the same call needs: the extract signature in `rlm_setup`, the turns before its SUBMIT, and the values it submitted.
+
+### Added
+
+- **`export_counterfactual_extracts(runs, cut_back=(0,))`** returns one `kind: "extract"` record per successful SUBMIT trajectory and cut. `messages` is dspy's own `Adapter.format` over the recorded extract signature and the turns before the SUBMIT turn, or `n` turns earlier for each `n` in `cut_back`, and is byte for byte the request a real extract over that history sends. The assistant side is the adapter's formatting of the submitted values. Each record carries `assistant_source: "counterfactual_submit"`, `verified: None` (no request was sent, so there is nothing to check it against) and `counterfactual: {submit_turn, cut_back, target_source}`. `custom_types` and `adapter` work as in `export_sft_turns(render="adapter")`, and neither existing export changes.
+- **`final.outputs`**: the output fields the program returned, by SUBMIT or by extract, as JSON in signature order, written when the kit captured the run's calls. A 1.25.0 trace has no `final.outputs`, so the export parses the SUBMIT turn's `FINAL: {...}` output instead (`target_source: "final_repr"`). When a value is not a Python literal, such as a pydantic model, it is read from the run's `result` event (`target_source: "result"`, the value after `output_model` validation), but only for a single-output signature, and only when that value, written as the parsed SUBMIT's repr, reproduces the `FINAL: {...}` line exactly. A value `output_model` or the JSON dump changed fails that check. A trajectory whose values cannot be read is skipped and counted in a warning.
+- **`parse_wrapped: true`** on a `main_step` or `extract` whose reply had no outer braces and parsed only after `_LenientJSONAdapter` added them, whether the reply came in the content or in the reasoning channel. The model did not write valid JSON for the signature, and `export_sft_turns(render="adapter")` either uses that reply as written or renders the parsed values, so its records carry the same field for a consumer to drop or count. Absent when the reply parsed as written. Parsing is unchanged.
+
+### Changed
+
+- **`main_lm_kwargs` and `sub_lm_kwargs` refuse the keys that change where a run goes or who it calls as**, not only `api_key`, `base_url`, `custom_llm_provider`, `timeout` and `model`. Newly refused: every key in dspy's `CLIENT_KEYS` (`api_base`, `headers`, `extra_headers`, `extra_query`, `api_version`, `organization`, `project`, `azure_ad_token_provider`), litellm `completion()`'s `deployment_id` and `model_list`, `mock_response`, `engine`, and any key starting `aws_`, `azure_` or `vertex_`. With `base_url` unset, `api_base` (litellm's alias for it) sent the run to another endpoint, and the trace named `api_base` only in `unrecorded_keys`, never its value, so nothing showed where the run went. An `Authorization` header in `extra_headers` replaced the kit's key on the wire, `aws_region_name` moved a Bedrock call to another region, `azure_ad_token` replaced the key on an Azure call, and `mock_response` returned a canned answer without calling a model. A config that passes one of these now raises at parse time. A role that needs its own endpoint or headers gets an LM you build and inject with `configure(main_lm=…)` / `configure(sub_lm=…)`. Provider-specific kwargs outside the three prefixes are not caught. A test keeps the set a superset of dspy's `CLIENT_KEYS`, so a newer dspy that adds a client setting fails CI instead of letting it through.
+
+## [1.25.0] - 2026-11-05
+
+**The trace now records what each planner call was shown, and `export_sft_turns` can return the exact request.** dspy sends each planner turn as one single-turn request formatted by the run's adapter, plus one `extract` request when the iteration budget runs out. The trace used to keep only each turn's `{reasoning, code, output}`, so a downstream converter had to render its own multi-turn chat, which trained the model on a format it is never served, and the extract call left no record. Everything added here is optional payload within `rlm-harness/trace/v2`.
+
+### Added
+
+- **An `rlm_setup` event, once per recorded trajectory**, with the adapter and its class, the running dspy version, the budgets read back from the built program, `variables_info` as the model saw it, the task's input and output field names, the documented tools, and both predictors' signatures with the instructions they actually used, compiled instructions included. It also carries `inputs_sha256`, one digest per input over its full value, for dedupe and for checking a corpus against an evaluation set, and `lm`, the main and sub LM's model and sampling settings. `lm` records an allowlist of settings and lists any other key by name only, so no credential is written.
+- **Per-call fields on `main_step`**: `iteration`, `history_len`, `messages_sha256`, `signature_sha256`, `completion` (the raw content string), `reasoning_content`, the `usage` of that call, `attempt`, `run_tag`, and `code_raw` when the code the model wrote differs from dspy's fence-stripped `code`. A value `rlm_setup` already holds appears on a step only when it differs.
+- **An `extract` event when the fallback ran**, with the same per-call fields and the parsed `outputs`. `final.extract` says whether it ran.
+- **`export_sft_turns(render="adapter")`** returns one record per action and extract call. Its `messages` are rebuilt by dspy's own `Adapter.format` and checked against the recorded hash (`verified`), the assistant side is the raw completion (`assistant_source` says when it had to be rendered instead), and `reasoning_content` stays a separate field. `custom_types=`, `adapter=` and `strict=` handle a type or adapter the trace cannot rebuild. The default export is unchanged.
+- **`RLMTask(run_tag=...)`**, a caller's label stamped on every recorded call.
+- `EVENT_RLM_SETUP` and `EVENT_EXTRACT` in `__all__`, and the module `rlm_harness.prompt_record`.
+
+### Notes
+
+- A field type whose schema has `$defs`, such as a pydantic model that nests another or `list[Flat]`, cannot be rebuilt from its recorded schema, because pydantic rejects references to definitions it did not generate. Pass the type in `custom_types` under its recorded annotation name; without it the export raises `RenderError` naming the type.
+- Per-call `usage` is what the usage tracker gained while the call was open, so it also counts another run's calls when your own `dspy.track_usage()` spans concurrent runs.
+- The parity tests capture each request with their own callback at the LM boundary and compare the export with it, across the json and chat adapters, action and extract calls, compiled instructions, a retry, and two runs under one recorder.
+- Verified before release against a reasoning model served by vLLM, under both adapters: every exported record verified against the request that was sent, extract calls and a nested output type included, every call had non-zero usage, the reasoning channel was recorded, and no credential appeared in any trace.
+
 ## [1.24.1] - 2026-10-23
 
 **The line a staged input adds to the instructions misled a model in two silent ways**: it let the

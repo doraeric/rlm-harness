@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("dspy")
 
 import rlm_harness
-from rlm_harness.claude_agent_lm import (
+from rlm_harness.community.claude_agent_lm import (
     _looks_rate_limited,
     _require_claude_agent_sdk,
     _translate_response_format,
@@ -124,7 +124,7 @@ def test_a_subscription_call_goes_through_THIS_adapter_and_not_litellm(fake_sdk,
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     lm = rlm_harness.ClaudeAgentLM("claude-sonnet-5")
-    from rlm_harness.claude_agent_lm import _AsyncClaudeAgentEngine, _ClaudeAgentEngine
+    from rlm_harness.community.claude_agent_lm import _AsyncClaudeAgentEngine, _ClaudeAgentEngine
 
     assert isinstance(lm.engine, _ClaudeAgentEngine), "dspy would route this call to litellm"
     assert isinstance(lm._async_engine_spec, _AsyncClaudeAgentEngine), "the async seat is unrouted"
@@ -219,7 +219,7 @@ def test_construction_without_sdk_fails_fast(monkeypatch):
 def _usage_of(raw):
     """Drive the REAL helper. Re-implementing the sum here would test the test: a mutation of the
     production arithmetic would leave a duplicated version green."""
-    from rlm_harness.claude_agent_lm import _prompt_tokens_from_sdk_usage
+    from rlm_harness.community.claude_agent_lm import _prompt_tokens_from_sdk_usage
 
     return _prompt_tokens_from_sdk_usage(raw)
 
@@ -637,7 +637,7 @@ def test_the_aggregate_is_the_three_TOP_LEVEL_input_fields_not_every_int_in_a_ro
     only the last, and a `compaction` entry's tokens are excluded from the totals outright. What
     this DOES pin is the double-count the nested members invite: adding every integer in `_ROUND`
     gives 2287, counting `cache_creation`'s 1080 twice."""
-    from rlm_harness.claude_agent_lm import _prompt_tokens_from_sdk_usage
+    from rlm_harness.community.claude_agent_lm import _prompt_tokens_from_sdk_usage
 
     assert _prompt_tokens_from_sdk_usage(_usage_with_rounds([_ROUND])) == 1082
 
@@ -662,7 +662,7 @@ def test_a_rejected_breakdown_is_logged_and_an_absent_one_is_not(sdk_returning, 
              ({"iterations": []}, 1), ({"iterations": None}, 0), ({}, 0)]
     for reported, expected in cases:
         caplog.clear()
-        with caplog.at_level(logging.DEBUG, logger="rlm_harness.claude_agent_lm"):
+        with caplog.at_level(logging.DEBUG, logger="rlm_harness.community.claude_agent_lm"):
             sdk_returning({"input_tokens": 5, "output_tokens": 2, **reported})
             _complete(rlm_harness.ClaudeAgentLM("sonnet"))
         assert len(caplog.records) == expected, f"wrong DEBUG count for {reported}"
@@ -914,7 +914,7 @@ def test_the_rate_limit_rung_fires_for_a_rate_limit_shape_only(sdk_returning, mo
     """The politeness ladder's own rung: one retry after a backoff, for a rate-limit-SHAPED error
     only. `_RATE_LIMIT_RE` is phrase-level precisely so ordinary error text ("failed to generate
     the delimiter") does not buy a sleep and a second call, and neither arm had a test."""
-    import rlm_harness.claude_agent_lm as cal
+    import rlm_harness.community.claude_agent_lm as cal
 
     monkeypatch.setattr(cal, "_BACKOFF_S", 0.0)   # the ladder, not the wait, is under test
     sdk = sdk_returning({"input_tokens": 1, "output_tokens": 1})
@@ -1026,7 +1026,7 @@ def test_n_above_one_spawns_one_cli_call_per_candidate_and_warns(sdk_returning, 
         yield sdk.ResultMessage()
 
     monkeypatch.setattr(sdk, "query", counting)
-    with caplog.at_level("WARNING", logger="rlm_harness.claude_agent_lm"):
+    with caplog.at_level("WARNING", logger="rlm_harness.community.claude_agent_lm"):
         lm = rlm_harness.ClaudeAgentLM("sonnet", n=3)
     warning = "\n".join(r.getMessage() for r in caplog.records)
     assert "3 subscription calls" in warning, f"the cost was not named: {warning!r}"
@@ -1046,6 +1046,6 @@ def test_no_warning_when_n_cannot_cost_anything(fake_sdk, monkeypatch, caplog, k
     """Noise is how a real warning gets ignored: the same reason `runtime.configure` keeps its
     timeout warning off the roles that consume the knob fully."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    with caplog.at_level("WARNING", logger="rlm_harness.claude_agent_lm"):
+    with caplog.at_level("WARNING", logger="rlm_harness.community.claude_agent_lm"):
         rlm_harness.ClaudeAgentLM("sonnet", **kwargs)
     assert not [r for r in caplog.records if "subscription calls" in r.getMessage()]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 from collections.abc import Callable, Sequence
@@ -32,7 +33,7 @@ from ._retry import run_with_retry
 from ._toolname import with_model_facing_description
 from .config import RLMConfig
 from .optimize import FINGERPRINT_KEY as _FINGERPRINT_KEY
-from .runtime import get_config, get_sub_lm
+from .runtime import _PARSE_WRAPPED, get_config, get_sub_lm
 from .sandbox import SandboxCancelled, build_interpreter, caller_owned
 from .sub_lm import _ensure_sub_call_recording, bind_recorder_to_sub_lm
 from .trace import EVENT_COMPILED_INSTRUCTIONS, _ensure_tool_timing, current_recorder
@@ -134,20 +135,137 @@ class _MainStepTimer(BaseCallback):  # type: ignore[misc, valid-type]
             self._recorder.note_main_step(outputs.get("reasoning"))
 
 
+def _bind_format_inputs(inputs: Any) -> tuple[Any, Any, Any] | None:
+    """``(signature, demos, inputs)`` out of an ``on_adapter_format_start`` payload, or ``None``.
+
+    dspy passes the callback ``inspect.getcallargs`` of whichever wrapper fired, and
+    ``Adapter.__init_subclass__`` wraps ``format`` again at every subclass level (see
+    :class:`_MainStepTimer`). The outer fires therefore carry ``{"args": (...), "kwargs": {...}}`` and
+    only the innermost has named keys; the kit's default adapter fires three times per format, the
+    first two positional. Both shapes are accepted and the result is type-checked, so a payload this
+    cannot read is skipped rather than misread.
+    """
+    if not isinstance(inputs, dict):
+        return None
+    names = ("signature", "demos", "inputs")
+    if "signature" in inputs:
+        bound = {n: inputs.get(n) for n in names}
+    else:
+        bound = dict(zip(names, tuple(inputs.get("args") or ())))
+        kwargs = inputs.get("kwargs") or {}
+        if isinstance(kwargs, dict):
+            bound.update({n: kwargs[n] for n in names if n in kwargs})
+    signature, demos, values = (bound.get(n) for n in names)
+    if not (isinstance(signature, type) and hasattr(signature, "fields")) or not isinstance(values, dict):
+        return None
+    return signature, list(demos or []), values
+
+
+class _StepCapture(BaseCallback):  # type: ignore[misc, valid-type]
+    """Records what each ``generate_action`` / ``extract`` call was shown and what it returned.
+
+    One instance per run attempt. A call is the window between ``on_module_start`` and
+    ``on_module_end`` of one of the RLM's two predictors, matched by identity, and every adapter-format
+    and LM event inside the window belongs to that call: the predictor's calls are sequential, and the
+    sub-LM and tool calls a turn's code makes run during execution, after the window closes. dspy logs
+    and swallows a callback that raises, and every hook here is guarded as well, so capture can thin a
+    trace but never fail a run.
+
+    Per call it keeps the signature, demos, adapter and input values given to the window's last
+    format (a ChatAdapter that falls back to JSON formats twice, and the second is the one answered),
+    the sha256 of the messages that format produced, the first LM output's raw content and
+    ``reasoning_content``, the parsed outputs, the usage the tracker gained during the window, and
+    whether ``_LenientJSONAdapter.parse`` needed its brace-wrap retry to parse the reply.
+    :func:`_compose_capture` turns these into JSON once, for the attempt that reaches the trace.
+    """
+
+    def __init__(self, roles: dict[str, Any], tracker: Any) -> None:
+        self._roles = [(role, predictor) for role, predictor in roles.items()]
+        self._tracker = tracker
+        self._open: dict[str, Any] | None = None
+        self.calls: list[dict[str, Any]] = []
+
+    def _role_of(self, instance: Any) -> str | None:
+        return next((role for role, p in self._roles if p is instance), None)
+
+    def on_module_start(self, call_id, instance, inputs):
+        role = self._role_of(instance)
+        if role is None:
+            return
+        baseline = (
+            _dspy_compat.usage_baseline(self._tracker) if self._tracker is not None else None
+        )
+        wrapped: list[bool] = []
+        try:
+            token = _PARSE_WRAPPED.set(wrapped)
+        except Exception:
+            token = None
+        self._open = {"role": role, "call_id": call_id, "baseline": baseline,
+                      "wrapped": wrapped, "token": token}
+
+    def on_adapter_format_start(self, call_id, instance, inputs):
+        if self._open is None:
+            return
+        bound = _bind_format_inputs(inputs)
+        if bound is not None:
+            self._open["format"] = (instance, *bound)
+
+    def on_adapter_format_end(self, call_id, outputs, exception=None):
+        if self._open is None or exception is not None or not isinstance(outputs, list):
+            return
+        from .prompt_record import messages_sha256
+
+        self._open["messages_sha256"] = messages_sha256(outputs)
+
+    def on_lm_end(self, call_id, outputs, exception=None):
+        if self._open is None or exception is not None:
+            return
+        first = outputs[0] if isinstance(outputs, list) and outputs else None
+        if isinstance(first, dict):
+            text = first.get("text")
+            self._open["completion"] = text if isinstance(text, str) or text is None else str(text)
+            reasoning = first.get("reasoning_content")
+            if reasoning is not None:
+                self._open["reasoning_content"] = str(reasoning)
+            else:
+                self._open.pop("reasoning_content", None)
+        elif isinstance(first, str):
+            self._open["completion"] = str(first)
+            self._open.pop("reasoning_content", None)
+
+    def on_module_end(self, call_id, outputs, exception=None):
+        call, self._open = self._open, None
+        if call is None:
+            return
+        if call["token"] is not None:
+            # Defensive: a reset from a context other than the start's raises, and the list is read
+            # either way. dspy 3.4.1 runs both hooks of a predictor call in one context.
+            with contextlib.suppress(ValueError):
+                _PARSE_WRAPPED.reset(call["token"])
+        if call["call_id"] != call_id or exception is not None:
+            return
+        if call["wrapped"]:
+            call["parse_wrapped"] = True
+        if call.get("baseline") is not None:
+            call["usage"] = _dspy_compat.usage_since(self._tracker, call["baseline"])
+        call["prediction"] = outputs
+        self.calls.append(call)
+
+
 @contextlib.contextmanager
-def _live_main_timing(recorder: Any):
+def _live_main_timing(recorder: Any, extra: Sequence[Any] = ()):
     """Install :class:`_MainStepTimer` into dspy's callback list for the duration, MERGING with any
     callbacks the consumer already set (dspy gathers ``settings.callbacks + instance.callbacks``, so
     appending coexists with e.g. a consumer's SSE callback). A no-op when there is no recorder, or when
     dspy's callback context can't be entered. The trace then keeps post-hoc main_step ts, no worse
-    than before.
+    than before. ``extra`` callbacks (the per-attempt :class:`_StepCapture`) ride in the same context.
     """
     if recorder is None or not hasattr(recorder, "note_main_step"):
         yield
         return
     try:
         existing = list(dspy.settings.get("callbacks") or [])
-        cm = dspy.context(callbacks=existing + [_MainStepTimer(recorder)])
+        cm = dspy.context(callbacks=existing + [_MainStepTimer(recorder), *extra])
         cm.__enter__()
     except Exception:
         logger.debug("live main-step timing unavailable; main_step ts stays post-hoc", exc_info=True)
@@ -160,6 +278,205 @@ def _live_main_timing(recorder: Any):
             cm.__exit__(None, None, None)
         except Exception:
             logger.debug("main-step timing context exit failed", exc_info=True)
+
+
+def _demos_as_json(demos: Sequence[Any]) -> list[dict[str, Any]]:
+    out = []
+    for demo in demos:
+        as_dict = demo.toDict() if hasattr(demo, "toDict") else dict(demo)
+        out.append(json.loads(json.dumps(as_dict, ensure_ascii=False, default=str)))
+    return out
+
+
+def _compose_capture(
+    rlm: Any, calls: list[dict[str, Any]], trajectory: Sequence[Any], *, attempt: int,
+    run_tag: str | None, inputs_sha256: dict[str, str] | None = None,
+    lms: dict[str, Any] | None = None, prediction: Any = None,
+) -> dict[str, Any] | None:
+    """One attempt's captured calls as trace payloads: ``rlm_setup``, per-turn fields, the extract.
+
+    ``steps`` is aligned to ``trajectory``: entry ``i`` holds the fields to add to turn ``i``'s
+    ``main_step``, or ``None``. Every action call appends exactly one REPL entry in dspy's loop, so the
+    i-th action call is turn i, and the alignment is still checked on ``reasoning``: a mismatch drops
+    that turn's fields instead of attaching another turn's prompt, because a missing field can be
+    skipped and a wrong one ends up in a training set.
+
+    Facts every call shares (adapter, ``variables_info``, ``max_output_chars``, demos, each predictor's
+    signature) are written once in ``setup``, and a call repeats one only when its value differs.
+    """
+    from .prompt_record import (
+        ROLE_ACTION,
+        ROLE_EXTRACT,
+        adapter_identity,
+        describe_signature,
+        outputs_as_json,
+        spec_sha256,
+    )
+
+    if not calls:
+        return None
+    predictors: dict[str, Any] = {}
+    for role, predictor in _dspy_compat.rlm_predictor_roles(rlm).items():
+        spec = describe_signature(predictor.signature)
+        demos = _demos_as_json(getattr(predictor, "demos", None) or [])
+        if demos:
+            spec["demos"] = demos
+        predictors[role] = {**spec, "sha256": spec_sha256(
+            {k: spec[k] for k in ("instructions", "fields")})}
+
+    first_fmt = next((c["format"] for c in calls if "format" in c), None)
+    first_values = first_fmt[3] if first_fmt else {}
+    first_history = first_values.get("repl_history")
+    budgets = _dspy_compat.rlm_budget_values(rlm)
+    setup: dict[str, Any] = {
+        **adapter_identity(first_fmt[0] if first_fmt else dspy.settings.adapter),
+        "dspy": getattr(dspy, "__version__", None),
+        "max_iterations": budgets.get("max_iterations"),
+        "max_llm_calls": budgets.get("max_llm_calls"),
+        "max_output_chars": getattr(first_history, "max_output_chars",
+                                    budgets.get("max_output_chars")),
+        "variables_info": list(first_values.get("variables_info") or []),
+        "input_fields": list(rlm.signature.input_fields),
+        "output_fields": list(rlm.signature.output_fields),
+        "tools": [
+            {"name": name, "desc": getattr(tool, "desc", None),
+             "args": json.loads(json.dumps(getattr(tool, "args", None) or {}, default=str))}
+            for name, tool in _dspy_compat.rlm_user_tools(rlm).items()
+        ],
+        "predictors": predictors,
+        "attempt": attempt,
+    }
+    if inputs_sha256:
+        # In the task signature's input order, like `input_fields`.
+        order = [n for n in setup["input_fields"] if n in inputs_sha256]
+        order += [n for n in inputs_sha256 if n not in order]
+        setup["inputs_sha256"] = {n: inputs_sha256[n] for n in order}
+    try:
+        lm_block = _lm_block(lms or {})
+    except Exception:
+        # A setting this cannot serialise loses the `lm` block, never the rest of the capture.
+        logger.warning("could not record the LM settings; rlm_setup omits lm", exc_info=True)
+        lm_block = {}
+    if lm_block:
+        setup["lm"] = lm_block
+    if run_tag is not None:
+        setup["run_tag"] = run_tag
+
+    def _fields(call: dict[str, Any]) -> dict[str, Any]:
+        role = call["role"]
+        out: dict[str, Any] = {}
+        if "format" in call:
+            adapter, signature, demos, values = call["format"]
+            spec = describe_signature(signature)
+            sha = spec_sha256(spec)
+            out["signature_sha256"] = sha
+            if sha != predictors.get(role, {}).get("sha256"):
+                out["signature"] = spec
+            ident = adapter_identity(adapter)
+            for key, value in ident.items():
+                if value != setup.get(key):
+                    out[key] = value
+            history = values.get("repl_history")
+            out["history_len"] = len(history) if history is not None else 0
+            if role == ROLE_ACTION:
+                out["iteration"] = values.get("iteration")
+            variables = list(values.get("variables_info") or [])
+            if variables != setup["variables_info"]:
+                out["variables_info"] = variables
+            chars = getattr(history, "max_output_chars", None)
+            if chars is not None and chars != setup["max_output_chars"]:
+                out["max_output_chars"] = chars
+            if demos:
+                as_json = _demos_as_json(demos)
+                if as_json != predictors.get(role, {}).get("demos"):
+                    out["demos"] = as_json
+        if "messages_sha256" in call:
+            out["messages_sha256"] = call["messages_sha256"]
+        if "completion" in call:
+            out["completion"] = call["completion"]
+        if "reasoning_content" in call:
+            out["reasoning_content"] = call["reasoning_content"]
+        if call.get("parse_wrapped"):
+            # The reply had no outer braces and parsed only after the adapter added them. The reply is
+            # `completion`, or `reasoning_content` when the content was empty and the adapter parsed
+            # the reasoning channel instead. Absent when the reply parsed as written. With n > 1 the
+            # flag covers every completion the call parsed; the RLM's predictors request one.
+            out["parse_wrapped"] = True
+        if "usage" in call:
+            out["usage"] = json.loads(json.dumps(call["usage"], default=str))
+        out["attempt"] = attempt
+        if run_tag is not None:
+            out["run_tag"] = run_tag
+        return out
+
+    actions = [c for c in calls if c["role"] == ROLE_ACTION]
+    steps: list[dict[str, Any] | None] = []
+    for turn, entry in enumerate(trajectory):
+        call = actions[turn] if turn < len(actions) else None
+        reasoning = entry.get("reasoning") if isinstance(entry, dict) else None
+        said = getattr(call["prediction"], "reasoning", None) if call else None
+        if call is None or said != reasoning:
+            steps.append(None)
+            continue
+        fields = _fields(call)
+        code = getattr(call["prediction"], "code", None)
+        if isinstance(code, str) and code != entry.get("code"):
+            fields["code_raw"] = code   # as the model wrote it; the turn's `code` is fence-stripped
+        steps.append(fields)
+
+    extract_call = next((c for c in calls if c["role"] == ROLE_EXTRACT), None)
+    extract = None
+    if extract_call is not None:
+        extract = _fields(extract_call)
+        sig = extract_call["format"][1] if "format" in extract_call else rlm.signature
+        extract["outputs"] = outputs_as_json(sig, extract_call["prediction"])
+    composed = {"setup": setup, "steps": steps, "extract": extract,
+                "extract_ran": extract_call is not None}
+    if prediction is not None:
+        try:
+            # What the program returned, by SUBMIT or by extract: the target a counterfactual
+            # extract record trains on (`dataset.export_counterfactual_extracts`).
+            composed["outputs"] = outputs_as_json(rlm.signature, prediction)
+        except Exception:
+            logger.warning("could not record the returned outputs; final omits outputs",
+                           exc_info=True)
+    return composed
+
+
+def _lm_block(lms: dict[str, Any]) -> dict[str, Any]:
+    """``rlm_setup.lm``: the main LM's settings, and the sub-LM's when they differ.
+
+    ``sub_same_as_main`` says which, so an absent ``sub`` is never ambiguous between "identical"
+    and "could not be read".
+    """
+    main = _dspy_compat.lm_settings(lms.get("main"))
+    sub = _dspy_compat.lm_settings(lms.get("sub"))
+    out: dict[str, Any] = {}
+    if main is not None:
+        out["main"] = main
+    if sub is not None:
+        if sub == main:
+            out["sub_same_as_main"] = True
+        else:
+            out["sub"] = sub
+            out["sub_same_as_main"] = False
+    return out
+
+
+def _inputs_sha256(inputs: dict[str, Any]) -> dict[str, str]:
+    """``{field: digest}`` over the values as bound; :func:`_compose_capture` orders them.
+
+    Per value: one that cannot be serialised loses its own digest, not every input's.
+    """
+    from .prompt_record import input_sha256
+
+    out: dict[str, str] = {}
+    for name, value in inputs.items():
+        try:
+            out[name] = input_sha256(value)
+        except Exception:
+            logger.warning("could not hash input %r; inputs_sha256 omits it", name, exc_info=True)
+    return out
 
 
 def _applied_dspy_settings(sub_lm: Any) -> dict[str, Any]:
@@ -314,6 +631,7 @@ class RLMTask:
         cancel_event: threading.Event | None = None,
         tools: Sequence[Callable[..., Any]] | None = None,
         compiled_instructions: str | None = None,
+        run_tag: str | None = None,
     ) -> None:
         if not self.signature:
             raise ValueError(f"{type(self).__name__} must define `signature`")
@@ -358,6 +676,10 @@ class RLMTask:
         #: Same order-independence as `tools=`: the explicit kwarg wins over the class field,
         #: resolved at build time rather than written onto the class here.
         self._compiled_override = compiled_instructions
+        #: A caller's label for this run, stamped on `rlm_setup`, every `main_step` and `extract`, for
+        #: grouping a corpus by model, budget or experiment arm. The kit never reads it, and `None`
+        #: writes no key.
+        self._run_tag = None if run_tag is None else str(run_tag)
 
     @property
     def resolved_tools(self) -> Sequence[Callable[..., Any]]:
@@ -900,6 +1222,15 @@ class RLMTask:
         # dspy a `LargeText` it would try to serialise.
         from .large_text import stage_inputs
 
+        # Hashed before staging, because staging replaces a `LargeText` with its sandbox path and
+        # the digest must be of the text. A value that cannot be hashed loses its digest, not the run.
+        bound_digests: dict[str, str] | None = None
+        if current_recorder() is not None:
+            try:
+                bound_digests = _inputs_sha256(inputs)
+            except Exception:
+                logger.warning("could not hash the task inputs; rlm_setup omits inputs_sha256",
+                               exc_info=True)
         inputs, self._staged = stage_inputs(inputs)
         rlm = self._build_rlm()
         # Two wrappers, and the ORDER is load-bearing.
@@ -945,6 +1276,14 @@ class RLMTask:
         # Scoping usage to "the attempt with the turns" would discard the fatal call's usage --
         # the one number this records at all.
         attempt_usage: list[dict[str, Any]] = []
+        # What each attempt's planner calls were shown, keyed by attempt index. Staged per attempt
+        # because the attempt whose turns reach the trace (`captured["attempt"]`) is not always the
+        # last, and one attempt's prompt beside another attempt's turns is a wrong training record.
+        attempt_calls: dict[int, list[dict[str, Any]]] = {}
+        roles = _dspy_compat.rlm_predictor_roles(rlm)
+        # Counted on its own rather than as `len(attempt_usage)`, which grows only when a usage
+        # tracker exists: without one every attempt would be 0 and overwrite the recorded one.
+        attempts_started = [0]
 
         async def runner() -> Any:
             # Capture each turn's LIVE timestamp as dspy parses it, so the post-hoc
@@ -953,10 +1292,14 @@ class RLMTask:
             recorder = current_recorder()
             if recorder is not None and hasattr(recorder, "begin_main_capture"):
                 recorder.begin_main_capture()
-            index = len(attempt_usage)
+            index = attempts_started[0]
+            attempts_started[0] += 1
             baseline = _dspy_compat.usage_baseline(tracker) if tracker is not None else {}
+            capture = _StepCapture(roles, tracker) if recorder is not None and roles else None
+            if capture is not None:
+                attempt_calls[index] = capture.calls
             try:
-                with _live_main_timing(recorder):
+                with _live_main_timing(recorder, (capture,) if capture is not None else ()):
                     # Inputs ONLY. dspy >= 3.4.0 made `aforward` keyword-only and deleted the
                     # positional interpreter argument 3.3.x took here; the interpreter now
                     # reaches dspy through the constructor factory `_build_rlm` passes.
@@ -975,6 +1318,29 @@ class RLMTask:
                     attempt_usage.append(
                         {"attempt": index, "calls": _dspy_compat.usage_since(tracker, baseline)}
                     )
+
+        def _composed() -> dict[str, Any] | None:
+            """The recorded attempt's capture as payloads, or `None` (a thinner trace) on any error.
+
+            Errors are logged, never raised: this also runs on the failure path, where a bookkeeping
+            error must neither lose the trajectory nor replace the run's own exception.
+            """
+            index = captured.get("attempt")
+            calls = attempt_calls.get(index) if index is not None else None
+            if not calls:
+                return None
+            try:
+                trajectory = getattr(captured["prediction"], "trajectory", None) or []
+                return _compose_capture(
+                    rlm, calls, list(trajectory), attempt=index, run_tag=self._run_tag,
+                    inputs_sha256=bound_digests,
+                    lms={"main": dspy.settings.lm, "sub": self._sub_lm},
+                    prediction=captured["prediction"],
+                )
+            except Exception:
+                logger.warning("could not compose the step capture; the trace keeps turns only",
+                               exc_info=True)
+                return None
 
         def _stage_budgets_and_usage() -> None:
             """Fold the applied caps and the per-attempt usage into `run_end`.
@@ -1032,14 +1398,16 @@ class RLMTask:
                 # "failed" and the SFT keep-filter (complete+valid) still excludes it. Then re-raise.
                 recorder = current_recorder()
                 if recorder is not None and "prediction" in captured:
-                    recorder.record_main_trajectory(captured["prediction"])
+                    recorder.record_main_trajectory(
+                        captured["prediction"], capture=_composed())
                 _stage_budgets_and_usage()
                 raise
 
             recorder = current_recorder()
             if recorder is not None:
                 if "prediction" in captured:
-                    recorder.record_main_trajectory(captured["prediction"])
+                    recorder.record_main_trajectory(
+                        captured["prediction"], capture=_composed())
                 recorder.record_result(result)
             _stage_budgets_and_usage()
             return result

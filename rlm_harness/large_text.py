@@ -41,6 +41,7 @@ the path is owned here and none of it is reachable by anything a model or an inp
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
 import secrets
@@ -74,7 +75,7 @@ class LargeText:
     payload. Delete the staged file with `close()`, or use it as a context manager.
     """
 
-    __slots__ = ("_chars", "_dir", "_path", "_preview_chars")
+    __slots__ = ("_chars", "_dir", "_path", "_preview_chars", "_sha256")
 
     def __init__(self, text: str, *, preview_chars: int = PREVIEW_CHARS) -> None:
         """Stage `text`. `preview_chars` is how much of it the MODEL is shown up front.
@@ -93,6 +94,10 @@ class LargeText:
             raise TypeError(f"LargeText takes a str, not {type(text).__name__}")
         self._chars = len(text)
         self._preview_chars = max(0, preview_chars)
+        # The digest a trace records for this input (`rlm_setup.inputs_sha256`). Taken from the
+        # text, not the staged file, because `write_text` translates newlines on Windows and the
+        # digest must match what the same text gets inline (`prompt_record.input_sha256`).
+        self._sha256 = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
         # mkdtemp, not a shared directory: the grant is per object, and a directory nothing else
         # writes into cannot have a sibling file appear in it between staging and mounting. It is
         # created at 0700 by mkdtemp itself, so there is no isolation reason for a caller to pass a

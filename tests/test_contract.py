@@ -62,6 +62,11 @@ def test_the_event_type_SET_is_closed(monkeypatch):
         "EVENT_RESULT",
         "EVENT_RUN_END",
         "EVENT_API_ROUNDS",
+        # 1.25.0: what each planner call was SHOWN (once per trajectory), and the extract fallback
+        # call that used to leave no record, so `export_sft_turns(render="adapter")` can rebuild the
+        # exact request instead of a converter inventing a chat format the model is never served.
+        "EVENT_RLM_SETUP",
+        "EVENT_EXTRACT",
     }
 
 
@@ -82,7 +87,7 @@ def test_RLMTask_declaration_fields_are_frozen():
 
     params = set(inspect.signature(RLMTask.__init__).parameters)
     assert {"config", "sub_lm", "max_retries", "interpreter", "cancel_event", "tools",
-            "compiled_instructions"} <= params, params
+            "compiled_instructions", "run_tag"} <= params, params
 
 
 def test_event_type_strings_are_frozen():
@@ -97,8 +102,10 @@ def test_event_type_strings_are_frozen():
         T.EVENT_RUN_END,
         T.EVENT_API_ROUNDS,
         T.EVENT_COMPILED_INSTRUCTIONS,
+        T.EVENT_RLM_SETUP,
+        T.EVENT_EXTRACT,
     ) == ("run_start", "main_step", "sub_call", "tool_call", "final", "result", "run_end",
-          "api_rounds", "compiled_instructions")
+          "api_rounds", "compiled_instructions", "rlm_setup", "extract")
 
 
 def test_a_v1_trace_still_reads_because_nothing_validates_the_schema(tmp_path):
@@ -227,6 +234,7 @@ def test_public_surface_includes_the_consumer_contract():
         "intercept_sub_lm", "model_as_tool", "get_sub_lm", "load_skills_as_tools",
         "TraceRecorder", "current_recorder", "record_tool_call", "load_events", "group_by_run",
         "export_sft_turns", "export_rl", "export_actions", "run_label_bundle",
+        "export_counterfactual_extracts",
         # REPL-safety rules a CONSUMER needs when it builds its own tools (1.1.0). Listed here
         # DELIBERATELY: the assertion below is a SUBSET check, so a new __all__ entry passes on
         # its own: being in `must_export` is what makes an accidental removal go red.
@@ -245,6 +253,7 @@ def test_public_surface_includes_the_consumer_contract():
         # trace contract constants. A consumer reads a trace against these, not raw strings
         "EVENT_RUN_START", "EVENT_MAIN_STEP", "EVENT_SUB_CALL", "EVENT_TOOL_CALL",
         "EVENT_FINAL", "EVENT_RESULT", "EVENT_RUN_END", "EVENT_API_ROUNDS",
+        "EVENT_RLM_SETUP", "EVENT_EXTRACT",
         # the provenance-typed memory (1.21.0): a consumer builds its store and tools on these
         "MemoryStore", "MemoryItem", "MemoryUnavailable", "PROVENANCES",
         "MemoryLabels", "PurgeRecord", "LABEL_KINDS", "LABEL_PROVENANCES", "SHORT_LIMIT",

@@ -2,7 +2,8 @@
 
 `ClaudeAgentLM` now ships in the kit: `from rlm_harness import ClaudeAgentLM`. The adapter's
 setup, politeness policy, and trade-offs live in its module docstring
-(`rlm_harness/claude_agent_lm.py`); this file is just the runnable demo. Prereqs:
+(`rlm_harness/community/claude_agent_lm.py`), and `rlm_harness/community/README.md` says what Anthropic
+allows and when it was last checked; this file is just the runnable demo. Prereqs:
 
   1. Log in to the Claude Code CLI with your Pro/Max account (`claude` → `/login`).
   2. `unset ANTHROPIC_API_KEY` (a leftover key would bill API credit; the adapter refuses).

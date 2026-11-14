@@ -527,7 +527,7 @@ def test_a_copied_subscription_lm_still_routes_through_its_own_engine():
     sys.modules["claude_agent_sdk"] = mod
     had_key = os.environ.pop("ANTHROPIC_API_KEY", None)
     try:
-        from rlm_harness.claude_agent_lm import _AsyncClaudeAgentEngine, _ClaudeAgentEngine
+        from rlm_harness.community.claude_agent_lm import _AsyncClaudeAgentEngine, _ClaudeAgentEngine
 
         lm = rlm_harness.ClaudeAgentLM("sonnet")
         dup = _dspy_compat.copy_lm(lm, rollout_id=1)
@@ -1105,7 +1105,7 @@ def test_a_mixed_args_error_keeps_its_readable_arguments_unquoted():
     assert json.loads(ns["last_exception_args"]()) == ["bad key", "slice(1, 2, None)"]
 
 
-def test_the_kits_own_LMs_are_off_the_interface_dspy_removes_in_3_5():
+def test_the_kits_own_LMs_are_off_the_interface_dspy_removes_in_3_5(tmp_path, monkeypatch):
     """The instrument for `docs/INVARIANTS.md`'s "stay free of that DeprecationWarning".
 
     dspy 3.4 deprecates implementing a custom LM through `forward()`/`aforward()` and schedules
@@ -1189,6 +1189,22 @@ def test_the_kits_own_LMs_are_off_the_interface_dspy_removes_in_3_5():
             if had_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = had_key
 
+        # `AntigravityLM`, through a fake `agy` that answers one result event: also an engine.
+        fake = tmp_path / "fake_agy.py"
+        fake.write_text(
+            "import json, sys\n"
+            "sys.stdin.read()\n"
+            "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
+            "'response': 'ok', 'usage': {'input_tokens': 1, 'output_tokens': 1}}}))\n",
+            encoding="utf-8",
+        )
+        from rlm_harness.community import antigravity_lm
+
+        monkeypatch.setattr(antigravity_lm, "_resolve_executable", lambda _: [sys.executable, str(fake)])
+        lm = rlm_harness.community.AntigravityLM("m")
+        assert lm("hi") == ["ok"]
+        assert asyncio.run(lm.acall(prompt="hi")) == ["ok"]
+
 
 def test_dspy_canonicalises_a_response_format_class_into_the_flat_shape_the_adapter_reads():
     """`ClaudeAgentLM._translate_response_format` reads `response_format["schema"]`, which is a
@@ -1208,7 +1224,7 @@ def test_dspy_canonicalises_a_response_format_class_into_the_flat_shape_the_adap
     import dspy
     from pydantic import BaseModel
 
-    from rlm_harness.claude_agent_lm import _translate_response_format
+    from rlm_harness.community.claude_agent_lm import _translate_response_format
 
     class _Out(BaseModel):
         headline: str
@@ -1303,3 +1319,39 @@ def test_configure_reaches_litellm_after_dspy_with_numpy_loaded():
     )
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr[-2000:]
+
+
+def _built_rlm(**budget):
+    def lookup(key: str) -> str:
+        """Look a key up."""
+        return key
+
+    sig = dspy.Signature("document: str -> answer: str", "Answer.")
+    return dspy.RLM(sig, tools=[lookup], **_dspy_compat.rlm_budget_kwargs(
+        max_iterations=budget.get("max_iterations", 7), max_llm_calls=budget.get("max_llm_calls", 3),
+        max_output_chars=budget.get("max_output_chars", 123)))
+
+
+def test_rlm_budget_values_reads_back_what_the_program_will_enforce():
+    """The trace's `rlm_setup.max_iterations` comes from here, and the model is shown it as the
+    `N` in `iteration: "k/N"`, so a rename must go red here rather than record a configured number."""
+    assert _dspy_compat.rlm_budget_values(_built_rlm()) == {
+        "max_iterations": 7, "max_llm_calls": 3, "max_output_chars": 123}
+
+
+def test_rlm_predictor_roles_finds_the_action_and_extract_predictors():
+    """Step capture matches calls to these by IDENTITY; a missing role means a thinner trace, so
+    the shape of each is asserted here, where a dspy rename would show."""
+    roles = _dspy_compat.rlm_predictor_roles(_built_rlm())
+    assert set(roles) == {"action", "extract"}
+    action, extract = roles["action"].signature, roles["extract"].signature
+    assert list(action.input_fields) == ["variables_info", "repl_history", "iteration"]
+    assert list(action.output_fields) == ["reasoning", "code"]
+    assert list(extract.input_fields) == ["variables_info", "repl_history"]
+    assert list(extract.output_fields) == ["answer"]
+
+
+def test_rlm_user_tools_is_the_documented_set_without_dspys_own():
+    tools = _dspy_compat.rlm_user_tools(_built_rlm())
+    assert list(tools) == ["lookup"]
+    assert "Look a key up." in tools["lookup"].desc

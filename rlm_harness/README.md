@@ -11,7 +11,7 @@ pitch, the quickstart, and installation: start at the
 | Module | Responsibility |
 |---|---|
 | `config.py` | Single source of truth; `RLMConfig.from_env()`. No dspy import. |
-| `runtime.py` | `configure()`: wires dspy + optional observability once, including auto-routing a `claude-agent-sdk/`-prefixed model string onto `ClaudeAgentLM`. |
+| `runtime.py` | `configure()`: wires dspy + optional observability once, including auto-routing a model string by its `community.ROUTES` prefix (`claude-agent-sdk/` onto `ClaudeAgentLM`, `agy/` onto `AntigravityLM`). |
 | `task.py` | `RLMTask` base class. |
 | `_retry.py` | Validation + retry engine (dspy-free, unit-tested). Mostly private, but `short_error` is public: head-and-tail elision for a caught exception, so a giant `AdapterParseError` (which embeds the whole raw completion) becomes one readable log line instead of thousands. |
 | `sandbox.py` | Interpreter selection + the insecure-sandbox guard. |
@@ -29,7 +29,8 @@ pitch, the quickstart, and installation: start at the
 | `skills.py` | `load_skills_as_tools`: expose a Skills directory to the RLM as tools. |
 | `trace.py` | `TraceRecorder`: unified append-only JSONL trajectory (main steps + sub-LM + tool calls). |
 | `replay.py` | Reconstruct/replay a recorded run using recorded tool outputs. |
-| `dataset.py` | `export_sft_turns` / `export_rl` / `export_actions` (turn traces into training datasets (`export_sft_turns` = per-root-turn SFT, the RLM recipe of arXiv 2512.24601); `run_label_bundle`) carry per-run LABEL surfaces beside the trajectory. |
+| `dataset.py` | `export_sft_turns` / `export_rl` / `export_actions` (turn traces into training datasets (`export_sft_turns` = per-root-turn SFT, the RLM recipe of arXiv 2512.24601; `render="adapter"` re-renders the exact request each planner call was sent, see "Re-rendering what the model was sent"; `export_counterfactual_extracts` builds extract-fallback samples from runs that ended by SUBMIT); `run_label_bundle`) carry per-run LABEL surfaces beside the trajectory. |
+| `prompt_record.py` | What each `generate_action` / `extract` call was shown, as JSON (`describe_signature`, `messages_sha256`), and the re-render behind `export_sft_turns(render="adapter")`. dspy-free at module top. |
 | `mcp.py` | MCP **client** (optional `rlm-harness[mcp]`): `mcp_tools` exposes an external server's tools as SYNC `dspy.Tool`s; `McpCatalog`/`McpConnection` for a progressive multi-server surface. |
 | `testing.py` | Offline forward-path harness: `ScriptedInterpreter`, `scripted_lm`, and the REPL-safety assertions `assert_repl_safe` / `assert_task_repl_safe`. |
 | `serving.py` / `harness_serve.py` | Server side of the harness-delegation contract: turn an `RLMTask` into a process that speaks it. |
@@ -37,10 +38,13 @@ pitch, the quickstart, and installation: start at the
 | `_toolname.py` | REPL-safety rules for a tool's NAME and SIGNATURE. Mostly private, but `is_valid_tool_name` / `sanitize_tool_name` / `unique_tool_names` / `signature_from_json_schema` are public: a consumer building its own tools (e.g. from `McpCatalog`'s raw names) needs the same derivation the kit uses. |
 | `_dspy_compat.py` | Private. Every cross-version dspy difference (kwarg renames, the interpreter seam, the recoverable/terminal error split) resolved by introspection in ONE place. |
 | `rubric.py` | Reward-free rubric primitives: the `Criterion`/`RubricCriteria`/`CriterionFact` types, `rubric_to_meta`/`rubric_from_meta`, `validate_rubric`, and a pure `criteria_facts(criteria, facts, lens)`. `category` is an OPAQUE caller-defined label, the kit imposes no taxonomy. See "Building a consumer". |
-| `claude_agent_lm.py` | `ClaudeAgentLM`: run rlm-harness on a Claude Pro/Max subscription: a `dspy.LM` over the official Claude Agent SDK. `configure()` now auto-routes a `SUBSCRIPTION_PREFIX`-carrying (`"claude-agent-sdk/"`) `main_model`/`sub_model` string onto it, no explicit `main_lm=`/`sub_lm=` wiring needed unless you're overriding it. Opt-in `rlm-harness[subscription]`; pure completions (no tools), lazily exported so `import rlm_harness` stays dspy/SDK-free. |
+| `community/` | Models on a vendor's consumer sign-in, and the warning that comes with them: `community/README.md` is the document to read first, `ROUTES` the prefix table `configure()` routes by. |
+| `community/claude_agent_lm.py` | `ClaudeAgentLM`: run rlm-harness on a Claude Pro/Max subscription: a `dspy.LM` over the official Claude Agent SDK. `configure()` now auto-routes a `SUBSCRIPTION_PREFIX`-carrying (`"claude-agent-sdk/"`) `main_model`/`sub_model` string onto it, no explicit `main_lm=`/`sub_lm=` wiring needed unless you're overriding it. Opt-in `rlm-harness[subscription]`; pure completions (no tools), lazily exported so `import rlm_harness` stays dspy/SDK-free. |
+| `community/antigravity_lm.py` | `AntigravityLM`: run rlm-harness on a Google Antigravity sign-in: a `dspy.LM` whose calls run the `agy` CLI. `configure()` auto-routes an `"agy/"` model string onto it through `community.ROUTES`. No extra: it needs the `agy` binary, found on PATH or at `~/.local/bin/agy`. Pure completions (no tools, none of the user's rules) through an agent it generates. Exported from `rlm_harness.community` only, outside SemVer; its terms row is in `community/README.md`. |
 | `examples/mini_run.py` | Minimal end-to-end live run: config + a tiny `RLMTask` through a real `dspy.RLM`, with the trajectory recorded and summarised. |
 | `examples/memory_run.py` | One live run over the whole memory arc: a host seeding `observed` and `said` items, the three tools in a task, `compute_memory_use`, `consolidate_run`, and `purge`. |
 | `examples/claude_agent_lm.py` | Runnable demo of `ClaudeAgentLM`: a tiny `RLMTask` through a real `dspy.RLM` on a subscription login. |
+| `examples/antigravity_lm.py` | The same demo on `AntigravityLM`, through `configure()`'s `agy/` auto-routing. |
 
 ## RLM as Harness Engineering (sub-LM hook + tracing)
 
@@ -1486,14 +1490,14 @@ yourself via `RLMTask(interpreter=...)`, which bypasses `build_interpreter` enti
 A turn-timeout restart replays the shim install, because a fresh sandbox would otherwise lose it
 while the prompt still offered it.
 
-## Subscription logins: this kit's adapter, and dspy's own providers
+## Subscription logins: this kit's adapters, and dspy's own providers
+
+**Read [`community/README.md`](community/README.md) first.** This kit's route below runs on a vendor's consumer sign-in, works as of the date its row there gives, and is not guaranteed to keep working: a vendor can change its terms or enforcement at any time. The same README notes that dspy's own sign-in providers, also covered below, carry the same risk.
 
 `ClaudeAgentLM` runs a Claude Pro/Max subscription through the official **Claude Agent SDK**, which
-spawns the `claude` CLI per call. Anthropic's support article covers that path explicitly: "You can
-still use the Claude Agent SDK, `claude -p`, and third-party apps with your subscription limits"
-([support.claude.com, "Use the Claude Agent SDK with your Claude plan"][claude-plan-sdk], read
-2026-10-14; the same page's 2026-06-15 update says the previously-announced changes to Agent SDK
-usage are PAUSED, so read it for the current state rather than trusting this quote's date).
+spawns the `claude` CLI per call. What Anthropic says about that path, quoted with the date it was
+read, is in the community README's table ([support.claude.com, "Use the Claude Agent SDK with your
+Claude plan"][claude-plan-sdk]).
 
 One kwarg is a cost multiplier here. `n=k` asks dspy for k candidates, dspy runs one engine call
 per candidate, and each of those is a separate `claude` CLI spawn charged to your own usage window:
@@ -1552,6 +1556,87 @@ needs the real event sequence, which nobody has observed yet: whether the switch
 whether it repeats per call. Recording them is what makes that observable. Until then, the account
 setting is the control.
 
+### Antigravity (`agy`): `AntigravityLM`
+
+`AntigravityLM` runs a call through `agy`, the Google Antigravity CLI, in its print mode, on the
+account you signed it in with. Install the CLI, run `agy` once to sign in, list the model ids your
+plan offers with `agy models`, and either route by model string or build the LM yourself:
+
+```bash
+export RLM_MAIN_MODEL=agy/<id>   # an id from `agy models`
+export RLM_SUB_MODEL=agy/<id>
+```
+
+```python
+from rlm_harness import RLMConfig, configure
+from rlm_harness.community import AntigravityLM
+
+lm = AntigravityLM("<id>", timeout_s=300)       # or executable="/path/to/agy"
+configure(RLMConfig.from_env(), main_lm=lm, sub_lm=lm)
+```
+
+**Read the `agy/` row of [`community/README.md`](community/README.md) before relying on this.**
+It quotes what Google's headless page, its FAQ and the Antigravity Additional Terms say about
+this use, with links and the date they were read. Google has not explicitly allowed it, so the
+route is "not explicit": the first `AntigravityLM` built in a process logs a warning saying so,
+and the route sits outside the kit's SemVer promise, exported from `rlm_harness.community` only.
+
+`agy` is an agent, not a completion endpoint, and it has no flag that removes its tools or its
+system prompt. So each call runs a custom agent the adapter writes into a private directory, with
+`excludeDefaultComponents: true` and no tools, whose body is the call's system prompt verbatim. That
+was measured against `agy` 1.4.12 with a control for each property: the model can read no file, the
+user's `~/.gemini/GEMINI.md` and a workspace `AGENTS.md` stay out, and dspy's system prompt is the
+one the model follows. A schema-constrained call gets `agy`'s `finish` tool and nothing else,
+because that is how `agy` enforces `--json-schema`. The module docstring lists each probe;
+`docs/INVARIANTS.md` lists which of them a change must not undo.
+
+**The use it is built for.** `AntigravityLM` runs Google's own `agy` binary in its documented print
+mode: `agy` signs in and makes every request, and the adapter never reads or reuses its
+credentials. It is built for the narrow use: **on your own machine, signed in with your own
+account, for your own work, never shared with other people and never put behind a service that
+other people or programs can reach.** Concurrency is capped at 2 per process, and `agy` does its
+own rate-limit retries, so the adapter adds none.
+
+**The bill stays on the sign-in.** Google's install page documents two variables that move it:
+`GEMINI_API_KEY` bills an API key once `agy`'s settings say `modelProvider: "gemini"`, and
+`AGY_ADC_AUTH=true` bills a Google Cloud project through Application Default Credentials. Every
+call starts `agy` with both removed from its environment, read when the call starts, so a key a
+`load_dotenv()` sets after `configure()` cannot reach it either; `allow_api_key=True` passes them
+through. The other auth-looking names in the binary (`GOOGLE_API_KEY`, the Vertex and Enterprise
+switches, the two base URLs) were each set alone to a bogus value on `agy` 1.5.0, and a signed-in
+print-mode call still answered normally. Combinations of them were not tried.
+
+**Which failures end the task.** On the planner seat, a deadline or a failed `agy` call (a status
+other than `SUCCESS`, a turn cut short, a non-zero exit) ends the task at once, as it does for
+`ClaudeAgentLM`: `agy` already retried what it could. On the sub-LM seat dspy.RLM shows the same
+failure to the model instead, as an exception from `llm_query` or an `"[ERROR] ..."` string from
+`llm_query_batched`. Bad model output is not raised: an empty answer, or a schema call answered
+without a structured object, comes back as an empty completion with a warning naming the
+conversation. On the planner seat the adapter's parse then fails and the task retries it within
+`max_retries`, as it would for any LM; on the sub-LM seat the code receives `""`.
+
+What it does not control:
+
+- **Every call is saved as an Antigravity conversation** under `~/.gemini/antigravity-cli`, about
+  400 KB each with the prompt in it, measured. `agy` has no option to skip that and the adapter
+  does not delete another program's state, so a long run leaves its transcripts there; the
+  response id is the conversation id.
+- **AI credits past your plan's quota.** `agy`'s `useG1Credits` setting "uses your AI credits for
+  model requests after your plan's quota runs out" ([CLI settings][agy-settings]). It lives in your
+  `settings.json`, which the adapter neither reads nor overrides.
+- **The first Ctrl-C reaching a sub-LM call.** On POSIX each `agy` runs in its own session, so a
+  deadline can kill it and everything it started with one signal; the same isolation keeps the
+  terminal's Ctrl-C from reaching it. Under `asyncio.run`, which is how `RLMTask.run` drives a run,
+  the first Ctrl-C cancels the planner's call and kills its `agy`, but a sub-LM call does not see
+  it (`llm_query` runs on the loop's thread inside the sandbox step, `llm_query_batched` on worker
+  threads) and runs until it answers or meets its deadline. A second Ctrl-C kills a call on the
+  main thread. A driver of your own that uses `loop.run_until_complete` instead gets no
+  cancellation at all on Ctrl-C: the interpreter waits for the planner's `agy` on exit. Use
+  `asyncio.run`.
+- **Sampling.** `agy` takes no `temperature`, `top_p` or `max_tokens`, so they are ignored, and
+  `applied_lm_budget` reports a `max_tokens` passed here that the call never applied. `n=k` is k
+  `agy` calls, and the constructor warns above 1.
+
 
 dspy ships its own subscription providers, and the kit needs no code for them: `configure()` takes a
 pre-built LM verbatim, so they go in through the same seam as any other.
@@ -1594,6 +1679,7 @@ because the CLI reads the Keychain itself.
 
 [claude-plan-sdk]: https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan
 [claude-costs]: https://code.claude.com/docs/en/costs
+[agy-settings]: https://antigravity.google/docs/cli/using/
 [cc-auth]: https://code.claude.com/docs/en/authentication
 [cc-96310]: https://github.com/anthropics/claude-code/issues/96310
 [cc-37512]: https://github.com/anthropics/claude-code/issues/37512
@@ -1613,13 +1699,16 @@ no equivalent one-liner here because its device-code flow is interactive.
 
 ## Timeouts: what bounds what
 
-Six different things can end a stuck run, on three different clocks, and no single one of them
-bounds a run's wall time. This is the whole map; reach for it before adding a seventh.
+Seven different things can end a stuck run, on three different clocks, and no single one of them
+bounds a run's wall time. This is the whole map; reach for it before adding an eighth. (The
+seventh, `AntigravityLM`'s, is `ClaudeAgentLM`'s twin for the other subscription adapter, not a
+new kind of bound.)
 
 | Knob | Env | Default | Bounds | On expiry |
 |---|---|---|---|---|
 | `RLMConfig.request_timeout_s` | `RLM_REQUEST_TIMEOUT` | unset → the provider SDK's own 600s | **one HTTP request attempt** to a litellm-backed LM | `LMTimeoutError`, which dspy classifies as RETRYABLE, so it is retried, not fatal |
 | `ClaudeAgentLM(timeout_s=…)` |: (constructor only) | 600s | **one whole call**, INCLUDING time queued behind the SDK's concurrency semaphore | `TimeoutError` |
+| `AntigravityLM(timeout_s=…)` |: (constructor only) | 600s | **one whole call**, INCLUDING time queued behind its concurrency cap of 2 | `TimeoutError`, after killing `agy` and every process it started (`killpg` on POSIX, `taskkill /T` on Windows) |
 | `RLMConfig.sandbox_turn_timeout_s` | `RLM_SANDBOX_TURN_TIMEOUT` | unset (disabled) | one whole `execute()` (`pyodide`/`deno`) (host-side tool and sub-LM dispatch time INCLUDED, which is why it is off by default | dspy's **recoverable** interpreter error) the model gets another turn |
 | `ContainerConfig.timeout_s` | `RLM_CONTAINER_TIMEOUT` | 120s | one `execute()`'s sandbox compute (`container`; host tool time excluded) | recoverable, same as above |
 | `RLMTask(cancel_event=…)` |, | unset | anything the caller decides | `SandboxCancelled`, **never** retried, never wrapped |
@@ -1635,13 +1724,14 @@ its own `COMPLETION_HTTP_FALLBACK_SECONDS` of 600s, so this field REPLACES that 
 introducing a bound where none existed. A consumer whose turns legitimately run longer must set it
 UP, not leave it alone.
 
-**The two 600s defaults are not the same quantity.** `request_timeout_s` bounds one HTTP request
-with retries around it; `ClaudeAgentLM`'s bounds one whole call including queueing, with nothing
-around it. Which one you get depends on the model string, and `request_timeout_s` deliberately does
-NOT drive the subscription route: under `llm_query_batched`'s thread fan-out, a value that is
-generous per request would make queued sub-LM calls time out from waiting alone. `configure()` warns
-when you set the knob and a role was auto-routed, and
-`configure(main_lm=ClaudeAgentLM(model, timeout_s=…))` is how you choose that number.
+**The 600s defaults are not the same quantity.** `request_timeout_s` bounds one HTTP request
+with retries around it; `ClaudeAgentLM`'s and `AntigravityLM`'s each bound one whole call including
+queueing, with nothing around it. Which one you get depends on the model string, and
+`request_timeout_s` deliberately does NOT drive a subscription route: under `llm_query_batched`'s
+thread fan-out, a value that is generous per request would make queued sub-LM calls time out from
+waiting alone. `configure()` warns when you set the knob and a role was auto-routed, naming the
+adapter it went to, and `configure(main_lm=ClaudeAgentLM(model, timeout_s=…))` (or
+`AntigravityLM(...)`) is how you choose that number.
 
 **A sandbox timeout and a cancel are opposite outcomes, on purpose.** The turn timeout is a
 safety net: it raises the error dspy CATCHES, so the model sees a dead turn and writes different
@@ -2337,7 +2427,7 @@ Five things to know:
   to the attempt with the turns would have discarded the fatal call's tokens, which is the number
   worth having. A run that never produced a prediction: `main_steps: 0`, the shape of the incident
   behind this. Records every attempt with none flagged.
-- **It is NOT per turn, and that is a limit, not an omission.** `sub_model` falls back to
+- **It is NOT per turn, and that is a limit, not an omission.** Planner calls have a per-call figure since 1.25.0, `main_step.payload.usage` and `extract.payload.usage` (see "Re-rendering what the model was sent"); sub-LM and tool-LM calls do not. `sub_model` falls back to
   `main_model`, and dspy propagates the tracker into `llm_query_batched`'s workers, so planner
   turns, sub-LM escalations and same-model tool-LM calls land in one flat list under one key with
   no call id and no timestamp. Nothing in dspy's tracker can key them apart. For a distribution
@@ -2561,6 +2651,125 @@ deliberately unchanged.
   NEGATIVE gap as unknown rather than as data (traces written before 1.6.1 can contain them; see
   that entry in `CHANGELOG.md`).
 
+## Re-rendering what the model was sent
+
+dspy does not run the planner as a chat. Each iteration sends one single-turn request from `generate_action`, and when the iteration budget runs out, one more from `extract`. The configured adapter (`RLM_ADAPTER`, `json` by default) formats each request from three inputs: the predictor's signature, its demos, and that call's values (`variables_info`, the REPL history, `iteration`). A dataset built from `main_step`'s `{reasoning, code, output}` alone has to invent a chat format of its own, and the model is never served that format. Since 1.25.0 the trace keeps the three inputs, and `export_sft_turns(render="adapter")` returns the request itself.
+
+### What is recorded
+
+Every field below is optional payload. A trace written before 1.25.0 has none of them, and neither does a run with no recorder.
+
+`rlm_setup` is written once per recorded trajectory, before its first `main_step`:
+
+- `adapter` (`json`, `chat`, `xml` or a class name) and `adapter_class`.
+- `dspy`, the running version.
+- `max_iterations`, `max_llm_calls` and `max_output_chars`, read back from the built program rather than from `RLMConfig`.
+- `variables_info`, the strings exactly as the model saw them: name, type, total length and preview.
+- `input_fields` and `output_fields`.
+- `inputs_sha256`, one sha256 per input over its full value as bound, before any preview. A `str` or a staged `LargeText` hashes its text as UTF-8 with `errors="surrogatepass"`. Any other value hashes `json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)` with json's default separators, after `model_dump(mode="json")` for a pydantic model. A value whose `str` changes between processes, such as a plain object or a `set`, will not dedupe.
+- `lm`: the `main` LM's `model`, its sampling `kwargs` and the names of its `unrecorded_keys`, plus the `sub` LM's when `sub_same_as_main` is false. `kwargs` is an allowlist applied at every depth (temperature, top_p, max_tokens, n, seed, reasoning effort, thinking budgets, the same keys under `extra_body`, and named inner keys of `thinking`, `reasoning` and `chat_template_kwargs`), so `api_key`, a base URL or a header appears only by name. Like `budgets`, it is what the LM carries, and an LM that ignores a kwarg still reports it.
+- `tools`, each with the `name`, `desc` and `args` dspy documents to the model. The rendered tool documentation itself is part of the action instructions.
+- `predictors.action` and `predictors.extract`: each signature's `instructions` and its `fields` in order (`name`, `io`, `type`, the type facts an adapter reads, and `extra` with `desc`, `prefix` and `constraints`), plus a `sha256`. The instructions are the ones the call used, so a run under `compiled_instructions` records the optimizer's text.
+- `attempt`, and `run_tag` when set.
+
+Each `main_step` adds:
+
+- `iteration`, the exact `"k/N"` string sent.
+- `history_len`, how many REPL entries the call was shown, which are this trajectory's earlier turns.
+- `messages_sha256`, of the messages the adapter produced, and `signature_sha256`.
+- `completion`, the LM's raw content string as returned, and `reasoning_content` when the provider sent a separate reasoning channel.
+- `usage`, `{model: [usage]}` gained while this call was open. A ChatAdapter that fell back to JSON shows two entries, and if your own `dspy.track_usage()` spans concurrent runs, another run's calls can appear too.
+- `attempt`, `run_tag`, and `code_raw` when the code the model wrote differs from dspy's fence-stripped `code`.
+- `parse_wrapped: true` (1.26.0) when the reply had no outer braces and `_LenientJSONAdapter` parsed it only after adding them. The reply is `completion`, or `reasoning_content` when the content was empty and the adapter parsed the reasoning channel. Absent when the reply parsed as written.
+- `signature`, `variables_info`, `max_output_chars`, `adapter` and `adapter_class`, only when they differ from `rlm_setup`, as they do for a ChatAdapter call that fell back to JSON.
+
+`extract` follows the last `main_step` when the fallback ran. It has the same per-call fields except `iteration`, plus `outputs`, the parsed output fields as JSON in signature order. `final.extract` is `true` or `false` when the kit captured the run's calls and absent when it could not tell; before 1.25.0 the only sign of the fallback was dspy's literal `final_reasoning` string. `final.outputs` (1.26.0) holds the output fields the program returned, by SUBMIT or by extract, as JSON in signature order.
+
+A turn the capture cannot match to its call (checked on `reasoning`) gets none of the per-call fields, because a missing field can be skipped and a wrong one becomes a training example. Calls are staged per retry attempt, and only the attempt whose turns reached the trace is written.
+
+### Exporting
+
+```python
+from rlm_harness import export_sft_turns, group_by_run, load_events
+
+records = export_sft_turns(group_by_run(load_events("trace.jsonl")), render="adapter")
+# {run_id, kind: "action"|"extract", turn, adapter,
+#  messages: [system, user],            # dspy's own Adapter.format over the recorded inputs
+#  assistant: {role: "assistant", content},
+#  assistant_source: "completion"|"rendered",
+#  verified: True|False|None,
+#  reasoning_content?, usage?, run_tag?, attempt?, parse_wrapped?}
+```
+
+- `messages` is rebuilt rather than stored. The history comes from this trajectory's earlier `main_step` entries, truncated by `max_output_chars` the way dspy truncates them, which keeps the trace linear in its turn count. `verified` compares the result with `messages_sha256`: `True` means it is the request that was sent, `False` means it is not, and `None` means no hash was recorded. `strict=True` raises on `False`.
+- `assistant.content` is the raw completion, unchanged. Without a completion, the record falls back to the adapter's own formatter over the parsed outputs and sets `assistant_source: "rendered"`. For JSON that is `json.dumps(..., indent=2)` in signature field order, because dspy's `JSONAdapter.format_finetune_data` raises `NotImplementedError` (dspy 3.4.1: `uv run python -c "import dspy; dspy.JSONAdapter().format_finetune_data(None, [], {}, {})"`).
+- `reasoning_content` stays a separate field. When a reasoning model returns empty content (`null` or `""`) with its answer in `reasoning_content`, which `_LenientJSONAdapter` handles by parsing the reasoning channel, the empty completion is not used as the target and the record is `"rendered"`.
+- `parse_wrapped: true` is copied from the call. The run accepted that reply only after the adapter added the outer braces. On a `"completion"` record, `assistant.content` is the reply as written, without them. On a `"rendered"` record, the reply came from `reasoning_content`, and `assistant.content` is valid JSON the model did not write in that form. Drop these records to train only on replies that parsed as written, or count them to see how often a model drops the braces.
+- An extract record's `turn` is the number of REPL entries it saw, one past the last action turn.
+- A field type is rebuilt from what an adapter reads off it: its name, and for a structured type its JSON schema. pydantic cannot rebuild a schema that has `$defs`, such as a model that nests another or `list[Flat]`, so pass the real type under the annotation name the trace recorded: `custom_types={"Article": Article}` or `{"list[Flat]": list[Flat]}`. Without it the export raises `RenderError` naming the type. A `dspy.Type` that adds its own description text is rebuilt without it, and the record comes out `verified: False`.
+- `adapter=` takes an adapter instance and is needed only for a run formatted by a class outside dspy's json, chat and xml families. The kit never imports a class named in a trace.
+- A call with nothing to render from is skipped and counted in a warning: every turn of a trace written before 1.25.0, and any turn the capture could not match to its call. The rest of the run still exports. The default `render=None` export is unchanged.
+
+### Extract samples from runs that submitted
+
+dspy sends its `extract` request only when a trajectory runs out of iterations, so a corpus holds few real extract calls, and most of those come from runs that failed. `export_counterfactual_extracts` builds the same call from a successful run that ended by SUBMIT: the request dspy would have sent had the run been cut off before its SUBMIT turn, answered with the values that SUBMIT returned.
+
+```python
+from rlm_harness import export_counterfactual_extracts, group_by_run, load_events
+
+records = export_counterfactual_extracts(group_by_run(load_events("trace.jsonl")), cut_back=(0, 2))
+# {run_id, kind: "extract", turn, adapter, messages,
+#  assistant: {role: "assistant", content},
+#  assistant_source: "counterfactual_submit",
+#  verified: None,
+#  counterfactual: {submit_turn, cut_back, target_source: "final.outputs"|"final_repr"|"result"},
+#  run_tag?, attempt?}
+```
+
+- `messages` is rendered from the extract signature in `rlm_setup.predictors.extract`, the run's `variables_info`, and the first `turn` REPL entries, where `turn = submit_turn - n` for each `n` in `cut_back`. With the same history it is byte for byte the request a real extract sends, and the tests check it against the `messages_sha256` recorded on one. No request was sent for this record, so `verified` is always `None`.
+- `n = 0` drops only the SUBMIT turn. A larger `n` cuts earlier, but the answer stays the final SUBMIT's values, which the shorter history may not yet support. A cut that would leave no history is skipped, since dspy never sends extract over an empty one.
+- `assistant.content` is the adapter's own formatting of the submitted values: indented JSON for the JSON adapter, `[[ ## field ## ]]` blocks for chat.
+- The values come from `final.outputs`. A 1.25.0 trace lacks it, so they are parsed from the SUBMIT turn's `FINAL: {...}` output (`target_source: "final_repr"`), which works when every value is a Python literal. A pydantic value's repr does not parse, and the value is read from the run's `result` event instead (`target_source: "result"`). That is the value after `output_model` validation and a Python-mode `model_dump`, and holds only `output_field`, so it can differ from what was submitted: a default or validator `output_model` adds, a `datetime` or `Enum` written as its `str`, a model nested in a list written as its `str`. It is used only when the signature has that one output field and writing the value as pydantic would repr the submitted one (`Verdict(summary='...', ...)`) reproduces the `FINAL: {...}` line exactly; dspy parses every SUBMIT against the field's type before writing that line. A trajectory whose values cannot be read any of these ways is skipped and counted in a warning.
+- Only a trajectory whose run has a `result` event counts, because the kit also records the last attempt of a failed run, and that SUBMIT was rejected. A run that ended by extract contributes nothing.
+
+### Using counterfactual extract records
+
+These records are synthetic. The model never wrote that assistant turn: the request is real in form, but no run sent it, and the answer is borrowed from the run's SUBMIT. Select or count them by `assistant_source == "counterfactual_submit"`. `verified` is always `None` on them because there is no sent request to hash, which is expected and not a failure.
+
+- **Train on them, never evaluate with them.** They say nothing about how well a model answers a real extract call: the answer was not produced by an extract call at all. Evaluate extract calls on live runs, or on the requests of real `extract` records (`export_sft_turns(render="adapter")`, `kind == "extract"`). A real record's assistant side is that model's own output, possibly from a run that failed, so it is an input to evaluate on, not a reference answer.
+- **Split by `run_id`.** A counterfactual's history is the exact input of its run's SUBMIT action turn, and the run's other action turns share prefixes of it, so keep all of a run's records on the same side of a train/validation split. Splitting by record puts near-duplicate inputs on both sides.
+- **Start with `cut_back=(0,)`.** It cuts just before the SUBMIT turn, where the history already holds what the run computed to reach its answer. A larger `n` adds samples for a run cut off earlier, which is what a tight iteration budget produces, but its answer is still the final SUBMIT's, so it teaches the model to state values its history does not yet support. Add larger cuts only if you accept that trade.
+- **Keep them a minority beside the real action turns.** Each one repeats the history of its run's SUBMIT turn and answers with the run's conclusion, so a corpus with many of them weights final answers over the turns that reached them, and every extra cut in `cut_back` adds another copy of the same answer. The kit does not pick a ratio, and capping them is what keeps that weight in check.
+- **No overlap with real extract records.** A trajectory that really ran extract produces no counterfactual, so the two never describe the same trajectory. A `run_id` that holds several trajectories, from several `arun` calls on one recorder, can hold one of each.
+
+One JSONL of the real action turns of successful runs and the counterfactual extracts, tagged by source. It leaves out real extract records, turns from runs that failed (their SUBMIT was rejected), any record that did not verify, and any reply that parsed only after the adapter added its braces:
+
+```python
+import glob
+import json
+
+from rlm_harness import export_counterfactual_extracts, export_sft_turns, group_by_run, load_events
+
+runs = {}
+for path in sorted(glob.glob("traces/*.jsonl")):
+    for run_id, events in group_by_run(load_events(path)).items():
+        runs[f"{path}:{run_id}"] = events          # two files can reuse a run_id
+
+custom_types = {}                                  # e.g. {"Report": Report} for a type with $defs
+succeeded = {k: ev for k, ev in runs.items() if any(e["type"] == "result" for e in ev)}
+real = [r for r in export_sft_turns(succeeded, render="adapter", custom_types=custom_types)
+        if r["kind"] == "action" and r["verified"] is not False and not r.get("parse_wrapped")]
+synthetic = export_counterfactual_extracts(runs, cut_back=(0,), custom_types=custom_types)
+
+with open("sft.jsonl", "w", encoding="utf-8") as out:
+    for rec in real:
+        out.write(json.dumps({**rec, "source": "real"}, ensure_ascii=False) + "\n")
+    for rec in synthetic:
+        out.write(json.dumps({**rec, "source": "counterfactual"}, ensure_ascii=False) + "\n")
+```
+
+`RLMTask(run_tag="...")` is stamped on `rlm_setup`, every `main_step` and `extract`, for grouping a corpus by model, budget or experiment arm. The kit never reads it.
+
 ## Trace utilization metrics
 
 `rlm_harness.metrics` answers "how was this run's activity distributed": a sibling question to
@@ -2706,7 +2915,7 @@ cached / custom client in production. It's the public seam for a test double, so
 has to reach into private runtime state; read the active config back with `get_config()`.
 
 **Claude-subscription auto-routing.** Set `RLM_MAIN_MODEL`/`RLM_SUB_MODEL` (or pass `main_model=`/
-`sub_model=` on `RLMConfig`) to `claude_agent_lm.SUBSCRIPTION_PREFIX` + a model id: e.g.
+`sub_model=` on `RLMConfig`) to `SUBSCRIPTION_PREFIX` + a model id: e.g.
 `claude-agent-sdk/claude-sonnet-5`, and `configure()` builds a `ClaudeAgentLM` for that role
 automatically; no explicit `main_lm=`/`sub_lm=` wiring needed. An explicit `main_lm=`/`sub_lm=`
 kwarg still wins outright regardless of the model string. The prefix is only consulted for a role
@@ -2717,6 +2926,15 @@ start while it's set: the Claude Code CLI silently prefers it over subscription 
 installed. Needs the same setup as `ClaudeAgentLM` itself (see the module's own docstring):
 building one by hand via `main_lm=ClaudeAgentLM(...)` still works exactly as before, for anyone who
 wants to pass its other constructor kwargs (`timeout_s`, `cwd`, …) explicitly.
+
+**Antigravity auto-routing** works the same way, through the `agy/` entry in `community.ROUTES`:
+`RLM_MAIN_MODEL=agy/<id>`, where `<id>` is one `agy models` lists for your account, builds a
+`community.AntigravityLM`, and the first one built in a process logs the not-explicit warning
+(see `community/README.md`). Its one constructor error is `FileNotFoundError` when `agy` is
+neither on PATH nor at `~/.local/bin/agy`; it does not refuse `GEMINI_API_KEY` or `AGY_ADC_AUTH`
+the way `ClaudeAgentLM` refuses `ANTHROPIC_API_KEY`, because it removes both from every call's
+environment instead. Build one by hand (`main_lm=AntigravityLM(id, timeout_s=…, executable=…)`)
+to choose its deadline or its binary.
 
 **Model names with a custom endpoint.** When `RLM_BASE_URL` is set, `configure` pins
 litellm's `custom_llm_provider="openai"`, so the model names are the **plain id your
@@ -2859,8 +3077,12 @@ winning:
 | Refused | Because | Instead |
 |---|---|---|
 | `model` | `dspy.LM` takes it positionally | `RLM_MAIN_MODEL` / `RLM_SUB_MODEL` |
-| `api_key`, `base_url`, `custom_llm_provider` | nothing records an override, so a silent one leaves a trace that reads like a run that went somewhere else | `RLM_API_KEY` / `RLM_BASE_URL`; a per-role ENDPOINT is a connection-identity change: build that role's LM and inject it with `configure(sub_lm=…)` |
+| `api_key`, `base_url`, `custom_llm_provider` | nothing records an override's value, so a silent one leaves a trace that reads like a run that went somewhere else | `RLM_API_KEY` / `RLM_BASE_URL`; a per-role ENDPOINT is a connection-identity change: build that role's LM and inject it with `configure(sub_lm=…)` |
 | `timeout` | same, and it is `request_timeout_s`'s own spelling | `RLM_REQUEST_TIMEOUT` |
+| `mock_response` | litellm answers it locally, so the run never reaches a model | nothing: a test that wants a canned answer injects its own LM |
+| `api_base`, `headers`, `extra_headers`, `extra_query`, `api_version`, `organization`, `project`, `azure_ad_token_provider`, `deployment_id`, `model_list`, `engine`, and any key starting `aws_`, `azure_` or `vertex_` | the other names dspy lists as client settings, litellm `completion()`'s routing parameters, and litellm's provider credential and region settings. A provider-specific key outside those three prefixes is not caught. With `base_url` unset, `api_base` sends the run to another endpoint, and an `Authorization` header in `extra_headers` changes the caller without touching `api_key`; a header that only tags a route looks the same in the trace | build that role's LM and inject it with `configure(main_lm=…)` / `configure(sub_lm=…)` |
+
+A consumer that reads the same kwargs from its own settings can check them before running anything by constructing the config, `RLMConfig(main_model, sub_model, main_lm_kwargs=...)`, which raises `ValueError` naming every refused key. That is the public check; the helper behind it is internal.
 
 `max_tokens` is deliberately NOT refused, and the line is not "everything the kit sets". It is
 whether the TRACE can see the override. `max_tokens` is read back off the LM into `budgets`

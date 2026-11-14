@@ -21,6 +21,7 @@ How the public surface is versioned, and how a downstream consumer drives change
   `docs/INVARIANTS.md` and `trace.SCHEMA`). If you find yourself wanting a hard rename because a
   consumer is the only caller, that is exactly the situation the rule exists for. There are nine
   of them now, and you cannot see all of their working trees.
+- **A community route other than `ClaudeAgentLM` is outside that promise.** A route in `rlm_harness/community/` runs on a vendor's consumer sign-in, and the vendor can withdraw that use at any time. So `ClaudeAgentLM` and `SUBSCRIPTION_PREFIX` stay in `__init__.__all__` under SemVer, and every later route is exported from `rlm_harness.community` only, never from `__all__`. Such a route may be withdrawn in a MINOR release with a CHANGELOG entry, and its prefix then raises an error that says why. Its `ROUTES` entry is the only thing `configure()` reads, so withdrawing it touches nothing else in the kit.
 
 ## Consumer-driven hardening
 

@@ -86,6 +86,21 @@ EVENT_RUN_END = "run_end"
 #: unaffected, which is the question this answers; attaching a breakdown to one specific call by
 #: adjacency is not available, and was not available from the usage entry either.
 EVENT_API_ROUNDS = "api_rounds"
+#: What the planner's calls were shown, once per recorded trajectory, before its `main_step` events
+#: (1.25.0, additive in v2). It holds what every call shares: the adapter, the dspy version, the
+#: budgets read back from the built program, `variables_info` as passed to the model, the task's input
+#: and output fields, `inputs_sha256`, the LM settings (`lm`), the documented tools, and both
+#: predictors' signatures with the instructions they used. The guide's "Re-rendering what the model
+#: was sent" lists every field. Absent when nothing was captured: no recorder, a dspy whose predictors
+#: the kit cannot find, a capture error the kit logged, or a trace written before 1.25.0. Its absence
+#: does not mean the model was shown nothing.
+EVENT_RLM_SETUP = "rlm_setup"
+#: dspy's `extract` fallback ran: the one extra call, when the iteration budget is spent, that asks
+#: the model for the task's output fields (1.25.0, additive in v2). Written after the trajectory's
+#: last `main_step` and before `final`, with a `main_step`'s per-call fields except `iteration`, plus
+#: `outputs`, the parsed output fields as JSON in signature order. `final.payload.extract` says
+#: whether the fallback ran, so this event's absence only means something beside it.
+EVENT_EXTRACT = "extract"
 
 _active: ContextVar[TraceRecorder | None] = ContextVar("rlm_harness_recorder", default=None)
 
@@ -710,7 +725,7 @@ class TraceRecorder:
         them after the fact is the only thing they do.
 
         A plain dict, because this module is dspy-free and SDK-free: the caller names the fields,
-        and `claude_agent_lm` is where an SDK event becomes one. Kept in arrival order, capped at
+        and `community.claude_agent_lm` is where an SDK event becomes one. Kept in arrival order, capped at
         :data:`MAX_RATE_LIMITS` with the overflow counted rather than silently dropped, since
         "how many times was this reported" is itself one of the things a reader wants.
         """
@@ -728,7 +743,7 @@ class TraceRecorder:
         NESTED even though nothing merges these events: the nesting was load-bearing against
         dspy's ``UsageTracker`` until 1.16.0, and keeping it means a reader that already parsed
         ``api_rounds["rounds"]`` out of the usage entry parses this payload unchanged. Entries stay
-        in the provider's own vocabulary; see ``claude_agent_lm._api_rounds`` for what one is and,
+        in the provider's own vocabulary; see ``community.claude_agent_lm._api_rounds`` for what one is and,
         more importantly, for what it is NOT (not a decomposition of the call's token totals).
 
         Returns the event, or ``None`` when there is nothing to record. Recorded live rather than
@@ -820,8 +835,16 @@ class TraceRecorder:
         with self._lock:
             self._exec_s.append((code, float(seconds)))
 
-    def record_main_trajectory(self, prediction: Any) -> None:
+    def record_main_trajectory(self, prediction: Any, *, capture: dict | None = None) -> None:
         """Extract the RLM ``Prediction`` trajectory into ``main_step`` events.
+
+        ``capture`` comes from ``task._compose_capture`` as plain dicts, so this module stays
+        dspy-free. It adds an :data:`EVENT_RLM_SETUP` before the turns, per-call fields merged into
+        each ``main_step`` (``iteration``, ``history_len``, ``messages_sha256``, ``completion``,
+        ``usage`` and the rest, listed in the guide's "Re-rendering what the model was sent"), an
+        :data:`EVENT_EXTRACT` after the turns when the fallback ran, and ``extract`` and ``outputs`` on
+        ``final``. A turn the capture could not be matched to (checked on ``reasoning``) gets none of
+        the per-call fields.
 
         Each turn's ``ts`` is the LIVE time it was parsed (from ``note_main_step``), matched by
         ``reasoning``, so a re-rendered trace reflects when turns actually happened, not when the
@@ -892,6 +915,10 @@ class TraceRecorder:
                     return t
             return None
 
+        capture = capture if isinstance(capture, dict) else {}
+        steps = capture.get("steps") or []
+        if capture.get("setup"):
+            self.record(EVENT_RLM_SETUP, capture["setup"])
         for turn, entry in enumerate(trajectory):
             entry = entry if isinstance(entry, dict) else {"raw": entry}
             reasoning = entry.get("reasoning")
@@ -909,15 +936,23 @@ class TraceRecorder:
             ran_for = _match_exec(entry.get("code"))
             if ran_for is not None:
                 payload["exec_duration_s"] = round(ran_for, 6)
+            extra = steps[turn] if turn < len(steps) else None
+            if isinstance(extra, dict):
+                payload.update({k: v for k, v in extra.items() if k not in payload})
             self.record(
                 EVENT_MAIN_STEP,
                 payload,
                 ts=_match_ts(reasoning),   # live per-turn ts, or None → clock() fallback
             )
-        self.record(
-            EVENT_FINAL,
-            {"final_reasoning": getattr(prediction, "final_reasoning", None)},
-        )
+        if isinstance(capture.get("extract"), dict):
+            self.record(EVENT_EXTRACT, capture["extract"])
+        final = {"final_reasoning": getattr(prediction, "final_reasoning", None)}
+        if "extract_ran" in capture:
+            # Written only when a capture ran. Without one the kit cannot tell, and the key is absent.
+            final["extract"] = bool(capture["extract_ran"])
+        if isinstance(capture.get("outputs"), dict):
+            final["outputs"] = capture["outputs"]
+        self.record(EVENT_FINAL, final)
 
     def record_result(self, output: Any) -> None:
         """Record the task's final validated output (after coercion)."""

@@ -295,7 +295,14 @@ def _run_meta(events: list[dict]) -> dict:
     return (rs["payload"].get("meta") or {}) if rs else {}
 
 
-def export_sft_turns(runs: dict[str, list[dict]]) -> list[dict]:
+def export_sft_turns(
+    runs: dict[str, list[dict]],
+    *,
+    render: str | None = None,
+    custom_types: dict[str, Any] | None = None,
+    adapter: Any = None,
+    strict: bool = False,
+) -> list[dict]:
     """Per-root-turn SFT samples: the RLM post-training recipe (arXiv 2512.24601, App. A).
 
     The paper fine-tunes by separating *each root RLM turn* (iteration) into its own SFT
@@ -308,10 +315,48 @@ def export_sft_turns(runs: dict[str, list[dict]]) -> list[dict]:
     "first user input" an RLM trajectory otherwise lacks (the prompt lives in a REPL variable,
     not a chat turn).
 
-    Each record is ``{run_id, turn, input: {initial, history}, output: {reasoning, code}}``:
-    format-agnostic. The trainer renders ``initial + history`` into its chat template and masks
-    the loss to ``output`` only (the assistant-only-loss multi-turn SFT the paper describes).
+    **Default (``render=None``): format-agnostic, unchanged since before 1.25.0.** Each record is
+    ``{run_id, turn, input: {initial, history}, output: {reasoning, code}}``. The trainer renders
+    ``initial + history`` into its chat template and masks the loss to ``output``. dspy does not send a
+    turn as a multi-turn chat, though: each turn is one single-turn request, so a template the trainer
+    chooses differs from the format the model is served.
+
+    **``render="adapter"`` (1.25.0): the request the run's adapter actually sent.** One record per
+    planner call, ``generate_action`` turns and the ``extract`` fallback alike, rendered by dspy's own
+    ``Adapter.format`` from the signature, demos and inputs the trace recorded (``rlm_setup`` plus the
+    per-call fields on ``main_step`` and ``extract``)::
+
+        {run_id, kind: "action" | "extract", turn, adapter,
+         messages: [{role: "system", ...}, {role: "user", ...}],   # the request, as sent
+         assistant: {role: "assistant", content},
+         assistant_source: "completion" | "rendered",
+         verified: True | False | None,
+         reasoning_content?, usage?, run_tag?, attempt?}
+
+    ``assistant.content`` is the LM's raw content string, unchanged (``assistant_source:
+    "completion"``). When the trace has none, or an empty one, the adapter's own formatter renders the
+    parsed outputs instead (``"rendered"``); for JSON that is ``json.dumps(..., indent=2)`` in signature
+    field order, since dspy's ``JSONAdapter.format_finetune_data`` is unimplemented.
+    ``reasoning_content``, the provider's separate reasoning channel, stays beside the message. An
+    extract record's ``turn`` is the number of REPL entries it saw.
+
+    ``verified`` compares the re-rendered ``messages`` with the sha256 of what was sent. ``False``
+    means the record is not the request the model saw: a wrong ``custom_types`` or ``adapter``, a
+    ``dspy.Type`` whose description text the rebuild lacks, or a dspy that formats differently from
+    the one that ran. ``None`` means no hash was recorded. ``strict=True`` raises instead of returning a
+    ``False``. A type that cannot be rebuilt at all (a schema with ``$defs``) raises ``RenderError``
+    naming it, whatever ``strict`` says.
+
+    ``custom_types`` maps a recorded type name (``"Article"``, or a whole annotation such as
+    ``"list[Article]"``) to the real type. ``adapter`` is an instance to format with, needed only for a
+    run formatted by a class outside dspy's json, chat and xml families. A call with nothing to render
+    from is skipped and counted in a warning: every turn of a trace written before 1.25.0, and any turn
+    the capture could not match to its call. This mode imports dspy; the default does not.
     """
+    if render not in (None, "adapter"):
+        raise ValueError(f"render must be None or 'adapter', not {render!r}")
+    if render == "adapter":
+        return _export_rendered_turns(runs, custom_types=custom_types, adapter=adapter, strict=strict)
     records: list[dict] = []
     for run_id, events in runs.items():
         initial = _run_meta(events)
@@ -333,6 +378,100 @@ def export_sft_turns(runs: dict[str, list[dict]]) -> list[dict]:
                     "output": p.get("output"),
                 }
             )
+    return records
+
+
+def _export_rendered_turns(
+    runs: dict[str, list[dict]], *, custom_types: dict[str, Any] | None, adapter: Any, strict: bool,
+) -> list[dict]:
+    from .prompt_record import RenderError, render_steps
+
+    records: list[dict] = []
+    skipped = 0
+    for run_id, events in runs.items():
+        rendered, missing = render_steps(events, custom_types=custom_types, adapter=adapter)
+        skipped += missing
+        for rec in rendered:
+            if strict and rec["verified"] is False:
+                raise RenderError(
+                    f"run {run_id!r} {rec['kind']} turn {rec['turn']}: the re-rendered request does "
+                    "not match the sha256 of the one that was sent. Check custom_types and adapter "
+                    "against what the run used."
+                )
+            records.append({"run_id": run_id, **rec})
+    if skipped:
+        logger.warning(
+            "export_sft_turns(render='adapter') skipped %d call(s) with no recorded request to "
+            "render: turns without an rlm_setup (a trace written before rlm-harness 1.25.0) or "
+            "turns the capture could not match to their call",
+            skipped,
+        )
+    return records
+
+
+def export_counterfactual_extracts(
+    runs: dict[str, list[dict]],
+    *,
+    cut_back: Iterable[int] = (0,),
+    custom_types: dict[str, Any] | None = None,
+    adapter: Any = None,
+) -> list[dict]:
+    """Extract-fallback SFT samples built from runs that ended by SUBMIT.
+
+    dspy's ``extract`` call runs only when a trajectory hits ``max_iterations`` without SUBMIT, which
+    in a healthy corpus is rare and mostly comes from failed runs, so real extract calls make a small
+    and skewed dataset. This builds the call from a run that did SUBMIT: the request is the
+    one dspy would send had the run been cut off before its SUBMIT turn, and the answer is the values
+    that SUBMIT returned. The default export and ``render="adapter"`` are unaffected; these records
+    come only from this function.
+
+    For each recorded trajectory that ended by SUBMIT in a run that succeeded (it has a ``result``
+    event), and for each ``n`` in ``cut_back``, one record::
+
+        {run_id, kind: "extract", turn, adapter,
+         messages: [{role: "system", ...}, {role: "user", ...}],
+         assistant: {role: "assistant", content},
+         assistant_source: "counterfactual_submit",
+         verified: None,
+         counterfactual: {submit_turn, cut_back, target_source},
+         run_tag?, attempt?}
+
+    ``messages`` is dspy's own ``Adapter.format`` over the extract signature recorded in
+    ``rlm_setup.predictors.extract``, the run's ``variables_info``, and a REPL history of the
+    trajectory's first ``turn`` entries, where ``turn = submit_turn - n``. ``n = 0`` drops only the
+    SUBMIT turn. A larger ``n`` cuts earlier, but the answer stays the final SUBMIT's values, which
+    the history at that point may not yet support. The request is byte for byte what a real extract
+    over the same history sends, but none was sent, so ``verified`` is always ``None``.
+
+    ``assistant.content`` is the adapter's own formatting of the SUBMIT values in signature order
+    (``json.dumps(..., indent=2)`` for JSON, the ``[[ ## field ## ]]`` blocks for chat).
+    ``counterfactual.target_source`` says where they were read: ``"final.outputs"``, recorded since
+    1.26.0. An older trace lacks it, so they are parsed from the SUBMIT turn's ``FINAL: {...}`` output
+    (``"final_repr"``), which works when every value is a Python literal, or else read from the run's
+    ``result`` event (``"result"``). ``result`` is the value after ``output_model`` validation and
+    holds only ``output_field``, so it is used only for a single-output signature, and only when
+    writing it as the parsed SUBMIT's repr reproduces that ``FINAL: {...}`` line exactly.
+
+    ``custom_types`` and ``adapter`` work as in ``export_sft_turns(render="adapter")``. Skipped and
+    counted in a warning: a trajectory whose SUBMIT values cannot be read, and a cut that would leave
+    an empty history. A run that ended by extract, failed, or predates ``rlm_setup`` (1.25.0)
+    contributes nothing and is not counted. This function imports dspy.
+    """
+    from .prompt_record import render_counterfactual_extracts
+
+    records: list[dict] = []
+    skipped = 0
+    for run_id, events in runs.items():
+        rendered, missing = render_counterfactual_extracts(
+            events, cut_back=cut_back, custom_types=custom_types, adapter=adapter)
+        skipped += missing
+        records.extend({"run_id": run_id, **rec} for rec in rendered)
+    if skipped:
+        logger.warning(
+            "export_counterfactual_extracts skipped %d record(s): SUBMIT values that could not be "
+            "read back from the trace, or a cut that left no history",
+            skipped,
+        )
     return records
 
 

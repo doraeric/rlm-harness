@@ -32,7 +32,13 @@ from ._toolname import (
 )
 from .atomic import atomic_write_stream, atomic_write_text
 from .config import RLMConfig
-from .dataset import export_actions, export_rl, export_sft_turns, run_label_bundle
+from .dataset import (
+    export_actions,
+    export_counterfactual_extracts,
+    export_rl,
+    export_sft_turns,
+    run_label_bundle,
+)
 from .isolation import run_in_subprocess
 from .large_text import LargeText, LargeTextRefused
 from .memory import (
@@ -88,9 +94,11 @@ from .sub_lm import SubLMValidationError, intercept_sub_lm, model_as_tool
 from .trace import (
     EVENT_API_ROUNDS,
     EVENT_COMPILED_INSTRUCTIONS,
+    EVENT_EXTRACT,
     EVENT_FINAL,
     EVENT_MAIN_STEP,
     EVENT_RESULT,
+    EVENT_RLM_SETUP,
     EVENT_RUN_END,
     EVENT_RUN_START,
     EVENT_SUB_CALL,
@@ -140,11 +148,15 @@ __all__ = [
     "EVENT_RESULT",
     "EVENT_RUN_END",
     "EVENT_API_ROUNDS",
+    # 1.25.0: what each planner call was shown, so a request can be re-rendered exactly
+    "EVENT_RLM_SETUP",
+    "EVENT_EXTRACT",
     # replay + dataset
     "load_timeline",
     "reconstruct",
     "RecordedToolProvider",
     "export_sft_turns",
+    "export_counterfactual_extracts",
     "export_rl",
     "export_actions",
     "run_label_bundle",
@@ -250,7 +262,7 @@ __all__ = [
     "compute_memory_use_by_run",
 ]
 
-__version__ = "1.24.1"
+__version__ = "1.26.0"
 
 
 def __getattr__(name: str):  # PEP 562 lazy re-export to defer dspy import
@@ -276,11 +288,11 @@ def __getattr__(name: str):  # PEP 562 lazy re-export to defer dspy import
 
         return getattr(_mcp, name)
     if name == "ClaudeAgentLM":  # optional Claude subscription LM (imports dspy now, the SDK on use)
-        from .claude_agent_lm import ClaudeAgentLM
+        from .community.claude_agent_lm import ClaudeAgentLM
 
         return ClaudeAgentLM
-    if name == "SUBSCRIPTION_PREFIX":  # the claude_agent_lm.py sentinel, joins the same lazy group
-        from .claude_agent_lm import SUBSCRIPTION_PREFIX
+    if name == "SUBSCRIPTION_PREFIX":  # community/claude_agent_lm.py's sentinel, same lazy group
+        from .community.claude_agent_lm import SUBSCRIPTION_PREFIX
 
         return SUBSCRIPTION_PREFIX
     if name in _MEMORY_TASK_NAMES:  # the labelling passes: memory_tasks.py imports dspy, so lazily

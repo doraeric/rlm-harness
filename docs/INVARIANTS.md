@@ -141,15 +141,17 @@ reason is in the rule.
 - **Keep the dspy-free modules dspy-free.** `config.py`, `_retry.py`, `sandbox.py`, `tools/`,
   `trace.py`, `skills.py`, `replay.py`, `dataset.py`, `serving.py`, `harness_serve.py`,
   `_dspy_compat.py`, `metrics.py`, `rubric.py`, `_toolname.py`, `atomic.py`, `isolation.py`,
-  `memory.py`, `memory_organise.py`, `memory_vectors.py`, `large_text.py` must NOT import `dspy` at module top:
+  `memory.py`, `memory_organise.py`, `memory_vectors.py`, `large_text.py`, `prompt_record.py`, `community/__init__.py` must NOT import `dspy` at module top:
   that keeps their logic testable without dspy. Only `task.py`, `runtime.py`, `sub_lm.py` (lazily), `mcp.py`,
-  `container_interpreter.py`, `testing.py`, `claude_agent_lm.py` and `memory_tasks.py` touch dspy:
-  the last five live outside the dspy-free set and are lazily imported (by `__getattr__` / by
-  `sandbox.build_interpreter`'s `"container"` branch / inside `testing.py`'s functions), so
-  `sandbox.py`'s module top and `import rlm_harness` stay dspy-free. `claude_agent_lm.py` (optional
+  `container_interpreter.py`, `testing.py`, `community/claude_agent_lm.py`,
+  `community/antigravity_lm.py` and `memory_tasks.py` touch dspy: the last six live outside the
+  dspy-free set and are lazily imported (by `__getattr__` / by `sandbox.build_interpreter`'s
+  `"container"` branch / inside `testing.py`'s functions), so `sandbox.py`'s module top and
+  `import rlm_harness` stay dspy-free. `community/claude_agent_lm.py` (optional
   `rlm-harness[subscription]`) additionally keeps its `claude-agent-sdk` import out of module top:
   deferred to instance construction, so `rlm_harness.ClaudeAgentLM` is gettable without the extra,
-  like `mcp_tools`.
+  like `mcp_tools`. `community/antigravity_lm.py` has no extra at all, because what it needs is the
+  `agy` binary rather than a package; it looks for that only when an instance is built.
 
   **`ClaudeAgentLM` is an ENGINE, not a `forward()` subclass, and the suite must stay free of that
   DeprecationWarning.** It was a `dspy.BaseLM` implementing `forward`/`aforward` until 1.17.0, on a
@@ -180,6 +182,7 @@ reason is in the rule.
   `<3.5.0` (see `pyproject.toml`) until then. `intercept_sub_lm`'s wrapper is NOT on the deprecated
   interface and needs no migration: it overrides `__call__`, not `forward`, and the same test
   covers it.
+- **A community route's `vendor_permission` comes from a quoted vendor statement, never from a reading of one.** `rlm_harness/community/README.md` has one row per route with the vendor's own words, a link and the date they were read, and `explicit` is set only when the vendor allows this use in writing. A route whose vendor has said nothing, or whose terms read against the use, is `not-explicit` and warns once per process when built. A permission inferred from silence, or from a forum reply nobody can attribute, is how a user loses an account on the kit's word. `tests/test_community.py` checks that each row exists, links and is dated; whether the quote still holds is re-checked by hand, and the date moves with it.
 - **`ClaudeAgentLM`'s politeness ladder rests on dspy's error CLASSIFICATION, and that dependency
   is a borrowed table.** `dspy/clients/execution.py` computes
   `retries = lm.num_retries if call.managed else 0`. While the class was unmanaged that budget was
@@ -204,7 +207,43 @@ reason is in the rule.
   for an `n` carried over from a litellm config on the belief this adapter ignores it, which is
   what the docstrings said. When reading this invariant for a NEW dspy behaviour, enumerate what
   `managed` turns on rather than checking the one knob that prompted the question: retries and `n`
-  arrived together and only one was noticed.
+  arrived together and only one was noticed. **Both halves hold for `AntigravityLM` too**, an
+  engine-backed LM since its first release, and its own tests pin each of them the same way.
+- **`AntigravityLM` gets a pure completion out of an AGENT (rules 1-4), and decides what a bad
+  answer, the bill and an abandoned call do (rules 5-7). Each rule is load-bearing.** `agy` has no
+  flag that removes its tools, its default prompt or the user's rules, so each call runs a custom
+  agent the adapter generates, in a private directory that is the call's working directory. The
+  measurements and their controls are in the module docstring of
+  `rlm_harness/community/antigravity_lm.py`, not repeated here; `tests/test_antigravity_lm.py`
+  pins each rule below. What Google has said about this use is in the `agy/` row of
+  `rlm_harness/community/README.md`, not here either.
+  1. **`excludeDefaultComponents: true` and `tools: []` stay in the frontmatter**, and
+     `--dangerously-skip-permissions` is never passed: together they are what keeps out every
+     tool, `agy`'s own prompt and the user's rules.
+  2. **A schema call gets `tools: [finish]`, and its answer is `structured_output`, never the
+     joined `response`.** Without `finish`, `agy` ignores the schema with a `SUCCESS` status: the
+     silent-degradation shape 1.17.0's structured-output regression had.
+  3. **The prompt goes on stdin as one stream-json event, never in argv.**
+  4. **The body of the agent file is the caller's system prompt, verbatim, and nothing else**
+     (`docs/PROMPT.md`); the sub-LM seat gets an empty body.
+  5. **Bad model output is RETURNED, failures are RAISED.** An empty answer, or a schema call with
+     no `structured_output`, comes back as an empty completion, so the adapter's parse fails and
+     the task retries it. Raising it instead (the shape it first shipped in) makes dspy wrap it
+     as a non-retryable `LMUnexpectedError` and ends the task on one bad answer. A deadline or a
+     failed `agy` call stays raised: fatal on the planner seat, like `ClaudeAgentLM`'s, and shown
+     to the model on the sub-LM seat, where dspy.RLM catches it.
+  6. **`GEMINI_API_KEY` and `AGY_ADC_AUTH` are removed from the environment of every call**, read
+     when the call starts. A check in the constructor (also the shape it first shipped in) misses
+     a key set after it, and `Popen` inherits whatever is set at the time.
+  7. **Every way a call ends kills its `agy`**: the deadline, any exception on the thread waiting
+     for it, and an `acall` left any way but its result (cancelled, or its coroutine closed),
+     whose worker thread `asyncio.to_thread` cannot stop. On POSIX `agy` runs in its own session
+     for the group kill, so the terminal's Ctrl-C never reaches it and only the adapter can end
+     it, which leaves a sub-LM call deaf to the first Ctrl-C (the class docstring says where).
+
+  What it does not control is said in its docstring and the guide rather than worked around:
+  every call is saved as an Antigravity conversation (about 400 KB each, prompt included), and
+  the adapter does not delete another program's private state.
 - **`import rlm_harness` must not import dspy.** `RLMTask` and `configure` are lazy
   re-exports in `__init__.py` (PEP 562). Don't make them eager.
 - **Resolve custom output types via `output_model`.** `RLMTask._build_rlm` passes
@@ -708,6 +747,18 @@ reason is in the rule.
   Re-audit it the same way next time rather than inheriting the conclusion; "no consumer validates
   the version" is a measurement with a date on it, and the first release that asserted it without
   measuring got the cost of a bump backwards.
+- **An SFT example's input is the request the adapter SENT, and the trace keeps what rebuilds it.** A consumer's converter read `main_step`'s `{reasoning, code, output}` and rendered its own multi-turn chat, while dspy sends each planner turn as one single-turn request formatted by the configured adapter and, under the default `json` adapter, expects JSON back. The model was trained on a format it is never served, and the trace could not have warned the converter: the prompt was not recorded, and the `extract` fallback call left no record (CHANGELOG 1.25.0). The rules:
+
+  * **Record the inputs to `Adapter.format`, not its output.** Signature and shared values go into `rlm_setup` once per trajectory, each call adds only what varies, and the REPL history is rebuilt from the trajectory's own earlier turns. Storing the rendered messages would grow a trace with the square of its turn count.
+  * **Hash what was sent, and check every re-render against it.** `messages_sha256` is taken from the adapter's output inside the call, and `export_sft_turns(render="adapter")` sets `verified` on each record. The two ways a re-render can drift silently, a type rebuilt from its schema and a dspy that formats differently, are invisible to a test run on today's dspy.
+  * **Prefer a missing field to a wrong one.** Per-call fields attach to a turn only when its `reasoning` matches the captured call. Calls are staged per attempt, and only the attempt whose turns reached the trace is written, the same last-writer-wins rule `run_end.usage` documents. A prompt beside another attempt's answer is a training error nobody will notice.
+  * **The assistant side is the raw completion, verbatim**, with `reasoning_content` as its own field. Formatting the parsed outputs is the fallback when the completion is missing or empty, and `assistant_source` says which was used.
+  * **Capture can thin a trace and can never fail a run.** It is a dspy callback (dspy logs and swallows one that raises), and the step that composes its payloads is suppressed and logged. The lookups dspy has renamed before, where the predictors live and what the budget attributes are called, go through `_dspy_compat.rlm_predictor_roles` and `rlm_budget_values`, and the tool set through `rlm_user_tools`. `prompt_record.py` reads dspy's adapter and REPL types directly (`get_annotation_name`, `serialize_for_json`, `REPLHistory`) because re-rendering is dspy's formatting; a dspy that changes them shows up as `verified: False` and in `tests/test_sft_render.py`.
+  * **`rlm_setup.lm` is an allowlist of `lm.kwargs`, never a dump with secrets removed.** `lm.kwargs` carries `api_key` for every LM the kit builds, and a caller's passthrough can hold a token under any name, so a denylist is one unexpected key away from a credential in every trace. `_dspy_compat._LM_SETTING_KEYS` names what is recorded, and every other key is listed by name in `unrecorded_keys`, so "not recorded" stays distinct from "not set". The allowlist must apply at every depth (`_LM_NESTED_KEYS`): an allowlisted name such as `thinking` or `chat_template_kwargs` says nothing about what a caller nested under it, and copying its whole value once wrote a nested secret into the trace. The test searches the serialised result for the secret value itself, at the top level and nested.
+  * **The export never imports a class named in a trace**, because that would execute whatever a trace file says. An adapter outside dspy's json, chat and xml families, or an output type pydantic cannot rebuild from its schema (one with `$defs`), comes from the caller through `adapter=` or `custom_types=`.
+  * **One call that cannot be rendered is skipped and counted**, never a reason to fail the rest of a corpus.
+
+  `tests/test_sft_render.py` is the pin. Its reference is its own callback at the LM boundary, never the kit's capture, because a test comparing the export with the kit's own record passes when capture and render are wrong in the same way.
 - **rlm-harness produces TRAJECTORIES, never reward.** The kit runs the RLM, records the trace,
   and turns traces into datasets (`export_sft_turns` / `export_rl` / `export_actions`). It does
   NOT score them: `export_rl` and `export_actions` carry a `reward=` HOOK the downstream trainer

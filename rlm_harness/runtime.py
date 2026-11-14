@@ -8,12 +8,15 @@ sub-LM via :func:`get_config` / :func:`get_sub_lm`.
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import importlib
 import logging
 from typing import Any
 
 import dspy
 
 from . import _dspy_compat
+from .community import Route, route_for
 from .config import RLMConfig
 
 logger = logging.getLogger(__name__)
@@ -27,6 +30,15 @@ class _Runtime:
 
 
 _STATE = _Runtime()
+
+#: Where ``_LenientJSONAdapter.parse`` reports that its brace-wrap retry is what parsed a reply. The
+#: per-call capture in ``task.py`` sets a fresh list for each predictor call and reads it when the
+#: call ends, so the trace can mark that step ``parse_wrapped``. A list rather than a flag, because a
+#: context copied into another thread still shares the list object. ``None`` outside a captured
+#: call, where nothing is recorded.
+_PARSE_WRAPPED: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar(
+    "rlm_harness_parse_wrapped", default=None
+)
 
 
 class _PromotedReasoning(str):
@@ -62,7 +74,9 @@ class _LenientJSONAdapter(dspy.JSONAdapter):
     2. **Brace-tolerant `parse`.** Schema-guided decoding intermittently drops the outer
        ``{`` ``}`` and returns just ``"a": 1, "b": 2``; stock parse then can't recover a dict.
        We retry once with the body wrapped in braces, unless it is empty, whitespace-only, or
-       already starts with a brace; a genuinely non-JSON response still raises.
+       already starts with a brace; a genuinely non-JSON response still raises. A reply the retry
+       parsed is reported through ``_PARSE_WRAPPED``, and the trace marks its call
+       ``parse_wrapped: true``.
 
     (A future, NIM-specific alternative is to drive ``nvext.guided_json`` directly instead of
     relying on ``response_format``: deliberately deferred; this keeps the path provider-agnostic.)"""
@@ -110,7 +124,7 @@ class _LenientJSONAdapter(dspy.JSONAdapter):
             if not body or body.startswith("{"):
                 raise
             try:
-                return super().parse(signature, "{" + body + "}")
+                parsed = super().parse(signature, "{" + body + "}")
             except AdapterParseError:
                 # The RETRY failed too, and its error quotes the text WE built, braces included.
                 # A consumer debugging a rare failure read `{We need answer with JSON...` as a
@@ -140,6 +154,10 @@ class _LenientJSONAdapter(dspy.JSONAdapter):
                     lm_response=original.lm_response,
                     message=note,
                 ) from None
+            sink = _PARSE_WRAPPED.get()
+            if sink is not None:
+                sink.append(True)
+            return parsed
 
     def _call_postprocess(self, processed_signature, original_signature, outputs, lm, lm_kwargs):
         """Promote ``reasoning_content`` to the answer when a reasoning root left ``content`` empty.
@@ -169,12 +187,11 @@ class _LenientJSONAdapter(dspy.JSONAdapter):
         )
 
 
-def _maybe_subscription_lm(model: str) -> dspy.LM | None:
-    """A ``ClaudeAgentLM`` when ``model`` carries the ``claude_agent_lm.SUBSCRIPTION_PREFIX``
-    sentinel, else ``None`` (leaving the caller to build a plain ``dspy.LM`` from ``config`` exactly
-    as before). Lazily imports ``claude_agent_lm``, only when the prefix actually matches, so
-    ``configure()``'s own module top, and every call that never touches a subscription-prefixed
-    model string, stays dspy-SDK-free.
+def _maybe_subscription_lm(model: str) -> tuple[dspy.LM, Route] | None:
+    """The LM for ``model`` and the ``community.ROUTES`` entry that built it, when ``model`` starts
+    with a route's prefix, else ``None`` (leaving the caller to build a plain ``dspy.LM`` from
+    ``config`` exactly as before). The route's adapter module is imported only when its prefix
+    matches, so a call that never names a community prefix imports none of them.
 
     Raises ``ValueError`` (not ``SystemExit``) for a bare prefix with no model id: `configure()` is
     called from arbitrary contexts: a server's request handler, a notebook cell, a library
@@ -182,18 +199,16 @@ def _maybe_subscription_lm(model: str) -> dspy.LM | None:
     dangerous default there than in a purpose-built CLI, which can catch `ValueError` and convert
     it to its own fail-fast behavior at its own top level if it wants that.
     """
-    from . import claude_agent_lm
-
-    if not model.startswith(claude_agent_lm.SUBSCRIPTION_PREFIX):
+    route = route_for(model)
+    if route is None:
         return None
-    name = model[len(claude_agent_lm.SUBSCRIPTION_PREFIX) :].strip()
+    name = model[len(route.prefix) :].strip()
     if not name:
         raise ValueError(
-            f"{model!r} names no model: expected "
-            f"{claude_agent_lm.SUBSCRIPTION_PREFIX}<id>, e.g. "
-            f"{claude_agent_lm.SUBSCRIPTION_PREFIX}claude-sonnet-5."
+            f"{model!r} names no model: expected {route.prefix}<id>, e.g. {route.prefix}{route.example}."
         )
-    return claude_agent_lm.ClaudeAgentLM(name)
+    adapter = getattr(importlib.import_module(route.module), route.attr)
+    return adapter(name), route
 
 
 def _warn_if_thinking_budget_cannot_act(role: str, lm: Any) -> None:
@@ -240,10 +255,10 @@ def configure(
     ``get_sub_lm``; an injected ``main_lm`` also becomes the dspy global. This is the public
     seam for supplying a test double, so nothing needs to reach into the private runtime state.
 
-    **Claude-subscription auto-routing.** For a role whose caller-supplied override is ``None``,
-    if ``cfg.main_model``/``cfg.sub_model`` starts with ``claude_agent_lm.SUBSCRIPTION_PREFIX``
-    (``"claude-agent-sdk/"``: the sentinel ``ClaudeAgentLM`` stamps its own model string with),
-    that role is built as a ``ClaudeAgentLM`` instead of a plain ``dspy.LM``, with ONLY the
+    **Community auto-routing.** For a role whose caller-supplied override is ``None``, if
+    ``cfg.main_model``/``cfg.sub_model`` starts with a prefix in ``community.ROUTES`` (such as
+    ``"claude-agent-sdk/"``, the sentinel ``ClaudeAgentLM`` stamps its own model string with),
+    that role is built by that route's class instead of a plain ``dspy.LM``, with ONLY the
     stripped model id: never ``lm_kwargs``
     (``api_key``/``base_url``/``custom_llm_provider``/``max_tokens``), which are meaningless (or,
     for ``base_url``, actively misleading) for this adapter. **``max_tokens`` is in that list, so
@@ -274,15 +289,16 @@ def configure(
     # Captured BEFORE auto-routing, because a per-role passthrough is a no-op on any LM this
     # function does not build -- explicitly injected and subscription-auto-routed alike.
     injected = {"main": main_lm is not None, "sub": sub_lm is not None}
-    auto_routed: list[str] = []
+    #: Each auto-routed role ("main_lm"/"sub_lm") and the class its route built.
+    auto_routed: dict[str, str] = {}
     if main_lm is None:
-        main_lm = _maybe_subscription_lm(cfg.main_model)
-        if main_lm is not None:
-            auto_routed.append("main_lm")
+        routed = _maybe_subscription_lm(cfg.main_model)
+        if routed is not None:
+            main_lm, auto_routed["main_lm"] = routed[0], routed[1].attr
     if sub_lm is None:
-        sub_lm = _maybe_subscription_lm(cfg.sub_model)
-        if sub_lm is not None:
-            auto_routed.append("sub_lm")
+        routed = _maybe_subscription_lm(cfg.sub_model)
+        if routed is not None:
+            sub_lm, auto_routed["sub_lm"] = routed[0], routed[1].attr
 
     # litellm (dspy.LM's backend) defaults to an aiohttp transport whose pooled ClientSession is bound to
     # the current asyncio loop. A driver that runs each task in its own short-lived `asyncio.run` loop
@@ -321,22 +337,22 @@ def configure(
         if auto_routed:
             # It reaches `dspy.LM` and nothing else, so on a subscription-routed role it is a
             # NO-OP, and a silent one is how a consumer ends up believing a route is bounded
-            # when it is not. Deliberately NOT forwarded as `ClaudeAgentLM(timeout_s=…)`: that
-            # is a different quantity (an END-TO-END per-call deadline that INCLUDES time queued
-            # behind the SDK's concurrency semaphore, not a per-HTTP-request bound that dspy and
-            # litellm each retry around), so one number cannot mean both. Under
-            # `llm_query_batched`'s thread fan-out a value that is generous per request would
-            # make queued sub-LM calls time out from waiting alone.
+            # when it is not. Deliberately NOT forwarded as the adapter's `timeout_s=`: every
+            # community route takes one, and it is a different quantity (an END-TO-END per-call
+            # deadline that INCLUDES time queued behind the adapter's concurrency cap, not a
+            # per-HTTP-request bound that dspy and litellm each retry around), so one number
+            # cannot mean both. Under `llm_query_batched`'s thread fan-out a value that is
+            # generous per request would make queued sub-LM calls time out from waiting alone.
+            routed = ", ".join(f"{role} to {attr}" for role, attr in auto_routed.items())
             logger.warning(
-                "request_timeout_s=%s bounds litellm-backed model requests only; %s "
-                "auto-routed to ClaudeAgentLM and %s unaffected by it. That route is still "
-                "bounded, by ClaudeAgentLM's own end-to-end per-call deadline (600s by "
-                "default): a DIFFERENT quantity, which is why this knob does not drive it. "
-                "To choose that number, build the LM yourself: "
-                "configure(main_lm=ClaudeAgentLM(model, timeout_s=...)).",
+                "request_timeout_s=%s bounds litellm-backed model requests only, and does not "
+                "reach the auto-routed %s (%s). Each of those is bounded by its adapter's own "
+                "end-to-end per-call deadline, a DIFFERENT quantity, which is why this knob does "
+                "not drive it. To choose that number, build the LM yourself and pass it in, "
+                "e.g. configure(main_lm=<Adapter>(model, timeout_s=...)).",
                 cfg.request_timeout_s,
-                " and ".join(auto_routed),
-                "is" if len(auto_routed) == 1 else "are",
+                "role" if len(auto_routed) == 1 else "roles",
+                routed,
             )
     # Both LMs are plain dspy.LM. In "json" mode it's _LenientJSONAdapter (not the LM) that
     # forces the json_schema response_format, so the LM needs no special capability flag.
@@ -355,15 +371,15 @@ def configure(
     main_kwargs = {**lm_kwargs, **(cfg.main_lm_kwargs or {})}
     sub_kwargs = {**lm_kwargs, **(cfg.sub_lm_kwargs or {})}
     for role, role_kwargs in (("main", cfg.main_lm_kwargs), ("sub", cfg.sub_lm_kwargs)):
-        if role_kwargs and injected[role]:
+        if role_kwargs and (injected[role] or f"{role}_lm" in auto_routed):
             # Same class of silence as the request_timeout_s warning above: the kwargs reach
             # `dspy.LM` and nothing else, so on a role whose LM this function did not build they
             # do NOTHING, and a consumer reading its own config would believe otherwise.
             logger.warning(
                 "%s_lm_kwargs=%s is ignored: the %s LM was %s, so configure() did not build it. "
-                "Pass these kwargs to the LM you inject, e.g. dspy.LM(model, **kwargs).",
+                "Pass these kwargs to an LM you build and inject, e.g. dspy.LM(model, **kwargs).",
                 role, sorted(role_kwargs), role,
-                "auto-routed to ClaudeAgentLM (which takes no sampling controls)"
+                f"auto-routed to {auto_routed[f'{role}_lm']}"
                 if f"{role}_lm" in auto_routed else "supplied explicitly",
             )
     if main_lm is None:
